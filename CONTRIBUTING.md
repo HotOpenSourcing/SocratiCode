@@ -51,7 +51,7 @@ See the [Developer Guide](DEVELOPER.md) for architecture details, data flows, an
 Use the [Bug Report](https://github.com/giancarloerra/socraticode/issues/new?template=bug_report.yml) issue template. Include:
 
 - Steps to reproduce
-- Expected vs actual behavior
+- Expected vs actual behaviour
 - Your environment (OS, Node.js version, embedding provider, MCP host)
 - Log output if available (set `SOCRATICODE_LOG_LEVEL=debug`)
 
@@ -122,6 +122,7 @@ See [DEVELOPER.md](DEVELOPER.md) for the full architecture overview.
 ## Review Process
 
 - All PRs are reviewed by a maintainer
+- [CodeRabbit](https://coderabbit.ai) automatically reviews every PR — address or resolve all comments before requesting human review
 - CI must pass (tests + type checking)
 - One approval required to merge
 - Maintainers may request changes or suggest alternatives

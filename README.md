@@ -10,6 +10,7 @@
   <a href="https://www.npmjs.com/package/socraticode"><img src="https://img.shields.io/npm/v/socraticode.svg" alt="npm version"></a>
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg" alt="Node.js >= 18"></a>
   <a href="https://github.com/giancarloerra/socraticode"><img src="https://img.shields.io/github/stars/giancarloerra/socraticode?style=social" alt="GitHub stars"></a>
+  <a href="https://discord.gg/5DrMXfNG"><img src="https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
 <p align="center">
@@ -21,21 +22,29 @@
 
 > *"There is only one good, knowledge, and one evil, ignorance."* — Socrates
 
-**Give any AI instant automated knowledge of your entire codebase (and infrastructure) — at scale, zero configuration, fully private, completely free.**
+**Your AI reads code. SocratiCode understands it.**
+
+**The open-source codebase context engine: give any AI instant automated knowledge of your entire codebase (and infrastructure) — at scale, zero configuration, fully private, completely free.**
 
 <p align="center">
   Kindly sponsored by <a href="https://altaire.com">Altaire Limited</a>
 </p>
 
 > If SocratiCode has been useful to you, please ⭐ **star this repo** — it helps others discover it — and share it with your dev team and fellow developers!
+>
+> 💬 Questions or just want to chat? Join us on [Discord](https://discord.gg/5DrMXfNG).
 
-**One thing, done well: deep codebase intelligence — zero setup, no bloat, fully automatic.** SocratiCode gives AI assistants deep semantic understanding of your codebase — hybrid search, polyglot code dependency graphs, and searchable context artifacts (database schemas, API specs, infra configs, architecture docs). Zero configuration — add it to **any MCP host**, or install the **Claude Code plugin** for built-in workflow skills. It manages everything automatically.
+> **☁️ SocratiCode Cloud (private beta)** — Hosted, shared team index built on the same engine as the open-source version, plus SSO, audit logs, branch-aware indexing, and VPC / air-gapped deployment options. The open-source core remains free forever. [Request early access →](https://socraticode.cloud)
 
-**Production-ready**, battle-tested on **enterprise-level** large repositories (up to and over **~40 million lines of code**). **Batched**, automatic **resumable** indexing checkpoints progress — pauses, crashes, restarts, and interruptions don't lose work. The file watcher keeps the **index automatically updated** at every file change and across sessions. **Multi-agent ready** — multiple AI agents can work on the same codebase simultaneously, sharing a single index with automatic coordination and zero configuration.
+**One thing, done well: deep codebase intelligence — zero setup, no bloat, fully automatic.** SocratiCode gives AI assistants deep semantic understanding of your codebase — **hybrid search, cross-project search, polyglot code dependency graphs, symbol-level impact analysis and flow, interactive HTML graph explorer for visual navigation, and searchable context artifacts (database schemas, API specs, infra configs, architecture docs)**. Zero configuration — add it to **any MCP host**, or install the **Native Plugin** for Claude Code, Cursor, VS Code Copilot, Codex or Gemini CLI. It manages everything automatically.
+
+**Production-ready**, battle-tested on **enterprise-level** large repositories (up to and over **~40 million lines of code**). **Batched**, automatic **resumable** indexing checkpoints progress — pauses, crashes, restarts, and interruptions don't lose work. The file watcher keeps the **index automatically updated** at every file change and across sessions. **Multi-branch, multi-repo** and **multi-agent ready** — multiple AI agents can work on the same codebase simultaneously, sharing a single index with automatic coordination and zero configuration.
 
 **Private and local by default** — Docker handles everything, no API keys required, no data leaves your machine. **Cloud ready** for embeddings (OpenAI, Google Gemini) and Qdrant, and a **full suite of configuration options** are all available when you need them.
 
-The first Qdrant‑based MCP/Claude Plugin/Skill that pairs auto‑managed, zero‑config local Docker deployment with **AST‑aware code chunking, hybrid semantic + BM25 (RRF‑fused) code search**, polyglot dependency **graphs** with circular‑dependency visualization, and searchable **infra/API/database artifacts** in a single focused, zero-config and easy to use code intelligence engine.
+**Code intelligence that belongs to you, AI and host agnostic** — your codebase's understanding lives with the code, not locked to any one assistant, IDE or model. And because SocratiCode pre-computes the hard parts (blast radius, call-flow, dependency traversal), **smaller models can handle architectural complex tasks that would otherwise need top-tier reasoning**, saving even more on token cost.
+
+The first Qdrant‑based MCP/Claude Plugin/Skill that pairs auto‑managed, zero‑config local Docker deployment with **AST‑aware code chunking, hybrid semantic + BM25 (RRF‑fused) code search**, polyglot dependency **graphs** with circular‑dependency visualisation, **symbol‑level Impact Analysis** (blast‑radius & call‑flow tracing across 18 languages), and searchable **infra/API/database artifacts** in a single focused, zero-config and easy to use code intelligence engine.
 
 > **Benchmarked on VS Code (2.45M lines):** SocratiCode uses **61% less context**, **84% fewer tool calls**, and is **37x faster** than grep‑based exploration — tested live with Claude Opus 4.6. [See the full benchmark →](#real-world-benchmark-vs-code-245m-lines-of-code-with-claude-opus-46)
 
@@ -52,6 +61,7 @@ The first Qdrant‑based MCP/Claude Plugin/Skill that pairs auto‑managed, zero
 ## Contents
 
 - [Quick Start](#quick-start)
+- [Plugins](#plugins)
 - [Why SocratiCode](#why-socraticode)
 - [Features](#features)
 - [Prerequisites](#prerequisites)
@@ -66,6 +76,8 @@ The first Qdrant‑based MCP/Claude Plugin/Skill that pairs auto‑managed, zero
 - [Testing](#testing)
 - [Why Not Just Grep?](#why-not-just-grep)
 - [FAQ](#faq)
+- [Community](#community)
+- [SocratiCode Cloud](#socraticode-cloud)
 - [License](#license)
 
 ---
@@ -74,7 +86,7 @@ The first Qdrant‑based MCP/Claude Plugin/Skill that pairs auto‑managed, zero
 
 > **Only [Docker](https://www.docker.com/products/docker-desktop/) (running) required.**
 
-**One-click install** — Claude Code, VS Code and Cursor,:
+**One-click install** — Claude Code, VS Code and Cursor:
 
 [![Install Claude Code Plugin](https://img.shields.io/badge/Claude_Code-Install_Plugin-CC785C?style=flat-square&logoColor=white)](#claude-code-plugin-recommended-for-claude-code-users)
 [![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_MCP_Server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=socraticode&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22socraticode%22%5D%7D) [![Install in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-Install_MCP_Server-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=socraticode&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22socraticode%22%5D%7D&quality=insiders) [![Install in Cursor](https://img.shields.io/badge/Cursor-Install_MCP_Server-F14C28?style=flat-square&logo=cursor&logoColor=white)](cursor://anysphere.cursor-deeplink/mcp/install?name=socraticode&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsInNvY3JhdGljb2RlIl19) 
@@ -114,6 +126,20 @@ claude mcp add socraticode -- npx -y socraticode
 
 > **Updating:** `npx` caches the package after the first run. To get the latest version, clear the cache and restart your MCP host: `rm -rf ~/.npm/_npx && claude mcp restart socraticode`. Alternatively, use `npx -y socraticode@latest` in your config to always check for updates on startup (slightly slower).
 
+**OpenCode** — add to your `opencode.json` (or `opencode.jsonc`):
+
+```json
+{
+  "mcp": {
+    "socraticode": {
+      "type": "local",
+      "command": ["npx", "-y", "socraticode"],
+      "enabled": true
+    }
+  }
+}
+```
+
 **OpenAI Codex CLI** — add to `~/.codex/config.toml`:
 
 ```toml
@@ -136,37 +162,93 @@ Restart your host. On first use SocratiCode automatically pulls Docker images, s
 
 > **Advanced**: cloud embeddings (OpenAI / Google), external Qdrant, remote Ollama, native Ollama, and dozens of tuning options are all available. See [Configuration](#configuration) below.
 
+## Plugins
+
+SocratiCode is available as a native plugin on multiple AI coding platforms. Plugins bundle the MCP server with workflow skills and agent instructions — one install gives you everything.
+
+| Platform | Install method |
+|:---------|:---------------|
+| Claude Code | `claude plugin marketplace add giancarloerra/socraticode && claude plugin install socraticode@socraticode` — [full instructions](#claude-code-plugin-recommended-for-claude-code-users) |
+| Cursor | `/add-plugin https://github.com/giancarloerra/socraticode` |
+| VS Code Copilot | Command Palette → `Chat: Install Plugin From Source` → `https://github.com/giancarloerra/socraticode` |
+| Zed | Add as a custom MCP server in Zed settings — [config example](#zed) |
+| Gemini CLI | `gemini extensions install https://github.com/giancarloerra/socraticode` |
+| OpenAI Codex | No public plugin directory yet — use the [MCP config](#quick-start) or see **Codex local install** below |
+
+> **VS Code Copilot**: The chat plugins feature is in preview. Enable it with `chat.plugins.enabled: true` in your VS Code settings.
+
+> **Codex local plugin install**: Clone the repo and register it in your personal plugin marketplace:
+> ```bash
+> git clone https://github.com/giancarloerra/socraticode.git ~/.agents/plugins/socraticode
+> ```
+> Then add it to `~/.agents/plugins/marketplace.json`:
+> ```json
+> {
+>   "plugins": [
+>     {
+>       "name": "socraticode",
+>       "path": "~/.agents/plugins/socraticode"
+>     }
+>   ]
+> }
+> ```
+> Codex will discover the plugin from `.codex-plugin/plugin.json` on next launch.
+
+> **All other MCP hosts** (Claude Desktop, Windsurf, Cline, Roo Code, OpenCode): Use the [MCP config](#quick-start) — works with any host that supports the MCP protocol.
+
 ## Why SocratiCode
 
 I built SocratiCode because I regularly work on existing, large, and complex codebases across different languages and need to quickly understand them and act. Existing solutions were either too limited, insufficiently tested for production use, or bloated with unnecessary complexity. I wanted a single focused tool that does deep codebase intelligence well — zero setup, no bloat, fully automatic — and gets out of the way.
 
-- **True Zero Configuration** — Just install the Claude Plugin/Skill or add the MCP server to your AI host config. The server automatically pulls Docker images, starts Qdrant and Ollama containers, and downloads the embedding model on first use. No config files, no YAML, no environment variables to tune, no native dependencies to compile, no commands to type. Works everywhere Docker runs.
-- **Fully Private & Local by Default** — Everything runs on your machine. Your code never leaves your network. The default Docker setup includes Ollama and Qdrant with no external API calls. Optional cloud providers (Qdrant, OpenAI, Gemini) are available but never required.
-- **Language-Agnostic** — Works with every programming language, framework, and file type out of the box. No per-language parsers to install, no grammar files to maintain, no "unsupported language" limitations. If your AI can read it, SocratiCode can index it.
-- **Production-Grade Vector Search** — Built on Qdrant, a purpose-built vector database with HNSW indexing, concurrent read/write, and payload filtering. Collections store both a dense vector and a BM25 sparse vector per chunk; the Query API runs both sub-queries in a single round-trip and fuses results with RRF. Designed for scale vector search.
-- **Flexible Embedding Providers** — Switch between Local Ollama (private), Docker Ollama (zero-config), OpenAI (fastest), or Google Gemini (free tier) with a single environment variable. No provider-specific configuration files.
-- **Enterprise-Ready Simplicity** — No agent coordination tuning, no memory limit environment variables, no coordinator/conductor capacity knobs, no backpressure configuration. SocratiCode scales by relying on production-grade infrastructure (Qdrant, proven embedding APIs) rather than complex in-process orchestration.
-- **Multi-Agent Ready** — Multiple AI agents share a single index with zero configuration. Cross-process locking coordinates indexing and watching automatically — one agent indexes, all agents search, one watcher keeps everyone current. Crashed agents don't block others; stale locks are reclaimed automatically.
-- **Measurably better than grep** — On VS Code's 2.45M‑line codebase, SocratiCode answers architectural questions with **61% less data**, **84% fewer steps**, and **37× faster** response than a grep‑based AI agent. [Full benchmark →](#real-world-benchmark-vs-code-245m-lines-of-code-with-claude-opus-46)
+### Built-in Code Search vs SocratiCode
+
+| Feature | Claude Code | Cursor | VS Code Copilot | + SocratiCode |
+|:--------|:-----------:|:------:|:---------------:|:-------------:|
+| Text / grep search | ✅ | ✅ | ✅ | ✅ |
+| Semantic search | — | ✅ | ✅¹ | ✅ |
+| Hybrid search (fused) | — | — | — | ✅ |
+| Code dependency graph | — | — | ✅² | ✅ |
+| Symbol-level impact / blast radius | — | — | — | ✅ |
+| Call-flow tracing (entry point → callees) | — | — | — | ✅ |
+| Interactive visual graph explorer | — | — | — | ✅ |
+| Circular dependency detection | — | — | — | ✅ |
+| Non-code knowledge (schemas, API specs) | — | — | — | ✅ |
+| Cross-project search | — | — | — | ✅ |
+| Branch-aware indexing | — | — | — | ✅ |
+| Multi-agent shared index | — | — | — | ✅ |
+| Tool-independent (survives switching AI) | — | — | — | ✅ |
+| Fully local / private | ✅ | —³ | —⁴ | ✅ |
+| Resumable indexing | — | — | — | ✅ |
+| Live file watching | — | ✅ | — | ✅ |
+
+<sub>¹ VS Code Copilot: remote index via GitHub / Azure DevOps; local "External Ingest" gradually rolling out. ² LSP-based Find References / Go to Definition (Usages tool), not a full dependency graph. ³ Cursor: embeddings processed on Cursor servers (encrypted in transit and at rest). ⁴ VS Code Copilot: remote index hosted on GitHub / Azure DevOps. Sources: [Cursor docs](https://docs.cursor.com/context/codebase-indexing), [Claude Code docs](https://docs.anthropic.com/en/docs/claude-code/overview), [VS Code Copilot docs](https://code.visualstudio.com/docs/copilot/chat/codebase-context).</sub>
+
+> **🔌 The context lives with your codebase, not with the assistant.** Built-in indexes (Cursor's, Copilot's) are tied to that one tool — switch assistants and you start from scratch. SocratiCode is independent: index once, then plug it into Claude Code, Cursor, Copilot, Windsurf, your own private model, or all of them at once. They share the same understanding of your code.
+
+On VS Code's 2.45M‑line codebase, SocratiCode answers architectural questions with **61% less data**, **84% fewer steps**, and **37× faster** response than a grep‑based AI agent. [Full benchmark →](#real-world-benchmark-vs-code-245m-lines-of-code-with-claude-opus-46)
 
 ## Features
 
-- **Hybrid code search** — Combines dense vector (semantic) search with BM25 lexical search, merged via Reciprocal Rank Fusion (RRF). Semantic search handles conceptual queries like "authentication middleware" even when those exact words don't appear in the code. BM25 handles exact identifier and keyword lookups that dense models struggle to rank precisely. RRF merges both result sets automatically — you get the best of both in every query with no tuning required.
+- **Hybrid code search** — Built on Qdrant, a purpose-built vector database with HNSW indexing, concurrent read/write, and payload filtering. Each chunk stores both a dense vector and a BM25 sparse vector; the Query API runs both sub-queries in a single round-trip and fuses results with Reciprocal Rank Fusion (RRF). Semantic search handles conceptual queries like "authentication middleware" even when those exact words don't appear in the code. BM25 handles exact identifier and keyword lookups. You get the best of both in every query with no tuning required.
 - **Configurable Qdrant** — Use the built-in Docker Qdrant (default, zero config) or connect to your own instance (self-hosted, remote server, or Qdrant Cloud). Configure via `QDRANT_MODE`, `QDRANT_URL`, and `QDRANT_API_KEY` environment variables.
 - **Configurable Ollama** — Use the built-in Docker Ollama (default, zero config) or point to your own Ollama instance (native install -GPU access-, remote server, etc.). Configure via `OLLAMA_MODE`, `OLLAMA_URL`, `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` environment variables.
-- **Multi-provider embeddings** — Beyond Ollama, use OpenAI (`text-embedding-3-small`) or Google Generative AI (`gemini-embedding-001`) for cloud-based embeddings. Just set `EMBEDDING_PROVIDER` and your API key.
-- **Private & secure** — Everything runs locally. Embeddings via Ollama, vector storage via Qdrant. No API costs, no token limits. Suitable for air-gapped and on-premises environments.
+- **Multi-provider embeddings** — Switch between Local Ollama (private, GPU access), Docker Ollama (zero-config), OpenAI (`text-embedding-3-small`, fastest), or Google Gemini (`gemini-embedding-001`, free tier) with a single environment variable. No provider-specific configuration files.
+- **Private & secure** — Everything runs on your machine — your code never leaves your network. The default Docker setup includes Ollama (embeddings) and Qdrant (vector storage) with no external API calls. No API costs, no token limits. Suitable for air-gapped and on-premises environments. Optional cloud providers (OpenAI, Google Gemini, Qdrant Cloud) are available but never required.
 - **AST-aware chunking** — Files are split at function/class boundaries using AST parsing (ast-grep), not arbitrary line counts. This produces higher-quality search results. Falls back to line-based chunking for unsupported languages.
 - **Polyglot code dependency graph** — Static analysis of import/require/use/include statements using ast-grep for 18+ languages. No external tools like dependency-cruiser required. Detects circular dependencies and generates visual Mermaid diagrams.
+- **Language-agnostic** — Works with every programming language, framework, and file type out of the box. No per-language parsers to install, no grammar files to maintain, no "unsupported language" limitations. If your AI can read it, SocratiCode can index it.
 - **Incremental indexing** — After the first full index, only changed files are re-processed. Content hashes are persisted in Qdrant so state survives server restarts.
 - **Batched & resumable indexing** — Files are processed in batches of 50, with progress checkpointed to Qdrant after each batch. If the process crashes or is interrupted, the next run automatically resumes from where it left off — already-indexed files are skipped via hash comparison. This keeps peak memory low and makes indexing reliable even for very large codebases.
 - **Live file watching** — Optionally watch for file changes and keep the index updated in real time (debounced 2s). Watcher also invalidates the code graph cache.
 - **Parallel processing** — Files are scanned and chunked in parallel batches (50 at a time) for fast I/O, while embedding generation and upserts are batched separately for optimal throughput.
 - **Multi-project** — Index multiple projects simultaneously. Each gets its own isolated collection with full project path tracking.
+- **Cross-project search** — Search across multiple related projects in a single query. Link projects via `.socraticode.json` or the `SOCRATICODE_LINKED_PROJECTS` env var, then set `includeLinked: true` on `codebase_search`. Results are tagged with project labels and deduplicated via client-side RRF fusion.
+- **Branch-aware indexing** — Maintain separate indexes per git branch by setting `SOCRATICODE_BRANCH_AWARE=true`. Each branch gets its own Qdrant collections, so switching branches instantly switches to the correct index. Ideal for CI/CD pipelines and PR review workflows.
 - **Respects ignore rules** — Honors all `.gitignore` files (root + nested), plus an optional `.socraticodeignore` for additional exclusions. Includes sensible built-in defaults. `.gitignore` processing can be disabled via `RESPECT_GITIGNORE=false`. Dot-directories (e.g. `.agent`) can be included via `INCLUDE_DOT_FILES=true`.
 - **Custom file extensions** — Projects with non-standard extensions (e.g. `.tpl`, `.blade`) can be included via `EXTRA_EXTENSIONS` env var or `extraExtensions` tool parameter. Works for both indexing and code graph.
 - **Configurable infrastructure** — All ports, hosts, and API keys are configurable via environment variables. Qdrant API key support for enterprise deployments.
-- **Auto-setup** — On first use, automatically checks Docker, pulls images, starts containers, and pulls the embedding model. Only prerequisite: Docker.
+- **Enterprise-ready simplicity** — No agent coordination tuning, no memory limit environment variables, no coordinator/conductor capacity knobs, no backpressure configuration. SocratiCode scales by relying on production-grade infrastructure (Qdrant, proven embedding APIs) rather than complex in-process orchestration.
+- **Auto-setup & zero configuration** — Just install the Claude Plugin/Skill or add the MCP server to your AI host config. On first use, the server automatically checks Docker, pulls images, starts Qdrant and Ollama containers, and downloads the embedding model. No config files, no YAML, no environment variables to tune, no native dependencies to compile. Works everywhere Docker runs.
 - **Session resume** — When reopening a previously indexed project, the file watcher starts automatically on first tool use (search, status, update, or graph query). It catches any changes made since the last session and keeps the index live — no manual action needed.
 - **Auto-start watcher** — The file watcher is automatically activated when you use any SocratiCode tool on an indexed project. It starts after `codebase_index` completes, after `codebase_update`, and on the first `codebase_search`, `codebase_status`, or graph query. You can also start it manually with `codebase_watch { action: "start" }` if needed.
 - **Auto-build code graph** — The code dependency graph is automatically built after indexing and rebuilt when watched files change. No need to call `codebase_graph_build` manually unless you want to force a rebuild.
@@ -226,18 +308,56 @@ User: "What files depend on the auth middleware?"
 
 User: "Show me the dependency graph"
 → codebase_graph_visualize {}
-  Returns a Mermaid diagram color-coded by language
+  Returns a Mermaid diagram colour-coded by language
 
 User: "Are there any circular dependencies?"
 → codebase_graph_circular {}
   Found 2 cycles: src/a.ts → src/b.ts → src/a.ts
+
+User: "What breaks if I rename validateUser?"
+→ codebase_impact { target: "validateUser" }
+  Blast radius for symbol: validateUser
+  Hop 1 (3 files): src/auth/login.ts, src/api/users.ts, tests/auth.test.ts
+  Hop 2 (5 files): ...
+
+User: "What does the server entry point actually do?"
+→ codebase_flow {}
+  Detected 4 entry point(s):
+    main (cmd/server.go:10) — well-known-name:main
+    healthz (src/api/routes.ts:42) — framework:get
+    ...
+→ codebase_flow { entrypoint: "main" }
+  └── main (cmd/server.go:10)
+      ├── loadConfig (cmd/server.go:15)
+      └── startServer (src/server.ts:8)
+          └── ...
+
+User: "Who calls bcryptCompare and what does it call?"
+→ codebase_symbol { name: "bcryptCompare" }
+  Symbol: bcryptCompare (function)
+  Defined: src/auth/hash.ts:42–58
+  Callers (3): ← src/auth/login.ts:12, ← src/auth/reset.ts:30 ...
+  Callees (1): → compare [unique, 1 candidate]
 ```
 
 ## Agent Instructions
 
 > **Claude Code plugin users**: These instructions are included automatically as skills in the SocratiCode plugin. You don't need to copy them into `CLAUDE.md`. The section below is for non-Claude Code hosts (VS Code, Cursor, Claude Desktop, etc.).
 
-For best results, add instructions like the following to your AI assistant's system prompt, `CLAUDE.md`, `AGENTS.md`, or equivalent instructions file. The core principle: **search before reading**. The index gives you a map of the codebase in milliseconds; raw file reading is expensive and context-consuming.
+For best results, add instructions like the following to your AI assistant's project-level instructions file. The core principle: **search before reading**. The index gives you a map of the codebase in milliseconds; raw file reading is expensive and context-consuming.
+
+**Where to place these instructions** (per IDE):
+
+| IDE / Tool | Instructions file |
+|:-----------|:-----------------|
+| Claude Code | `CLAUDE.md` at project root (auto-loaded). Plugin users get this via skills automatically. |
+| Cursor | `AGENTS.md` at project root, or `.cursor/rules/socraticode.mdc` for a dedicated rule file |
+| VS Code Copilot | `.github/copilot-instructions.md`, or a custom instructions file in your VS Code User prompts folder |
+| Zed | `AGENTS.md` at project root (Zed auto-reads it), or use the Rules Library to create a default rule |
+| Windsurf | `.windsurfrules` at project root |
+| Claude Desktop / Cline / Roo Code | Add directly to your system prompt configuration |
+
+> **Why this matters**: Installing the MCP server alone gives your agent access to SocratiCode tools, but the agent still decides when to use them. Adding these instructions to your project ensures the agent consistently prefers SocratiCode search over raw file reads, uses the graph for dependency-aware tasks, and follows the search-before-reading workflow.
 
 ```markdown
 ## Codebase Search (SocratiCode)
@@ -261,19 +381,39 @@ before reading any files directly.
 2. **Follow the graph before following imports.**
    Use `codebase_graph_query` to see what a file imports and what depends on it before
    diving into its contents. This prevents unnecessary reading of transitive dependencies.
+   - **Before modifying or deleting a file**, check its dependents with `codebase_graph_query`
+     to understand the blast radius.
+   - **When planning a refactor**, use the graph to identify all affected files before
+     making changes.
 
-3. **Read files only after narrowing down via search.**
+3. **Use Impact Analysis BEFORE refactoring, renaming, or deleting code.**
+   The symbol-level call graph (`codebase_impact`, `codebase_flow`, `codebase_symbol`,
+   `codebase_symbols`) goes one step deeper than the file graph: it knows which
+   functions and methods call which.
+   - `codebase_impact` answers "what breaks if I change X?" (blast radius — every file
+     that transitively calls into the target).
+   - `codebase_flow` answers "what does this code do?" by tracing forward from an entry
+     point. Call with no `entrypoint` to discover candidate entry points (auto-detected
+     via orphans, conventional names like `main()`, framework routes, tests).
+   - `codebase_symbol` gives a 360° view of one function: definition, callers, callees.
+   - `codebase_symbols` lists symbols in a file or searches by name.
+   - Always prefer these over reading multiple files when the question is about
+     dependencies between functions, not concepts.
+
+4. **Read files only after narrowing down via search.**
    Once search results clearly point to 1–3 files, read only the relevant sections.
    Never read a file just to find out if it's relevant — search first.
 
-4. **Use `codebase_graph_circular` when debugging unexpected behavior.**
+5. **Use `codebase_graph_circular` when debugging unexpected behaviour.**
    Circular dependencies cause subtle runtime issues; check for them proactively.
+   Also run `codebase_graph_circular` when you notice import-related errors or unexpected
+   initialisation order.
 
-5. **Check `codebase_status` if search returns no results.**
+6. **Check `codebase_status` if search returns no results.**
    The project may not be indexed yet. Run `codebase_index` if needed, then wait for
    `codebase_status` to confirm completion before searching.
 
-6. **Leverage context artifacts for non-code knowledge.**
+7. **Leverage context artifacts for non-code knowledge.**
    Projects can define a `.socraticodecontextartifacts.json` config to expose database
    schemas, API specs, infrastructure configs, architecture docs, and other project
    knowledge that lives outside source code. These artifacts are auto-indexed alongside
@@ -292,6 +432,13 @@ before reading any files directly.
 | Find a specific function, constant, or type | `codebase_search` (exact name) or grep if you know already the exact string |
 | Find exact error messages, log strings, or regex patterns | grep / ripgrep |
 | See what a file imports or what depends on it | `codebase_graph_query` |
+| Check blast radius before modifying or deleting a file | `codebase_impact` (symbol-level) or `codebase_graph_query` (file-level) |
+| **What breaks if I change function X?** | `codebase_impact target=X` |
+| **What does this entry point actually do?** | `codebase_flow entrypoint=X` |
+| **List entry points in this codebase** | `codebase_flow` (no args) |
+| **Who calls this function and what does it call?** | `codebase_symbol name=X` |
+| **What functions/classes exist in this file?** | `codebase_symbols file=path` |
+| **Search for symbols by name across the project** | `codebase_symbols query=X` |
 | Spot architectural problems | `codebase_graph_circular`, `codebase_graph_stats` |
 | Visualise module structure | `codebase_graph_visualize` |
 | Verify index is up to date | `codebase_status` |
@@ -348,7 +495,7 @@ Or from within Claude Code:
 /plugin update socraticode@socraticode
 ```
 
-**Configuring environment variables:** SocratiCode works with zero config for most users (local Ollama + managed Qdrant). If you need cloud embeddings, a remote Qdrant, or other customization:
+**Configuring environment variables:** SocratiCode works with zero config for most users (local Ollama + managed Qdrant). If you need cloud embeddings, a remote Qdrant, or other customisation:
 
 1. **Claude Code settings** (recommended) — add to `~/.claude/settings.json`:
    ```json
@@ -380,6 +527,41 @@ Requires Node.js 18+ and Docker (running). Already covered in [Quick Start](#qui
       "args": ["-y", "socraticode"]
     }
 ```
+
+#### Zed
+
+Add SocratiCode as a custom MCP server in Zed's settings (`Zed > Settings > Settings` or `cmd+,`). Under `context_servers`, add:
+
+```json
+{
+  "context_servers": {
+    "socraticode": {
+      "command": "npx",
+      "args": ["-y", "socraticode"],
+      "env": {}
+    }
+  }
+}
+```
+
+To pass environment variables (e.g. for cloud embeddings or branch-aware indexing), add them to the `env` object:
+
+```json
+{
+  "context_servers": {
+    "socraticode": {
+      "command": "npx",
+      "args": ["-y", "socraticode"],
+      "env": {
+        "EMBEDDING_PROVIDER": "openai",
+        "OPENAI_API_KEY": "sk-..."
+      }
+    }
+  }
+}
+```
+
+Zed auto-reads `AGENTS.md` from the project root for agent instructions. Copy the [Agent Instructions](#agent-instructions) block into your project's `AGENTS.md` to ensure the agent uses SocratiCode tools effectively. You can also add them as a default rule in Zed's Rules Library (`agent: open rules library`).
 
 #### From source (for contributors)
 
@@ -546,6 +728,64 @@ With this config, agents running in `/repo/main`, `/repo/worktree-feat-a`, and `
 - Your AI agent reads actual file contents from its own worktree; the shared index is only used for discovery and navigation
 - When changes merge back to main, the file watcher re-indexes the changed files and the index converges
 
+### Cross-Project Search (linked projects)
+
+If you work across multiple related repositories or packages, you can search them all in a single query.
+
+#### Configuration
+
+Create a `.socraticode.json` file in your project root:
+
+```json
+{
+  "linkedProjects": [
+    "../shared-lib",
+    "/absolute/path/to/other-project"
+  ]
+}
+```
+
+Or set the `SOCRATICODE_LINKED_PROJECTS` environment variable (comma-separated paths):
+
+```bash
+SOCRATICODE_LINKED_PROJECTS="../shared-lib,/absolute/path/to/other-project"
+```
+
+Both sources are merged and deduplicated. Relative paths are resolved from the project root. Non-existent paths are silently skipped.
+
+#### Usage
+
+Pass `includeLinked: true` to `codebase_search`:
+
+> Search for "authentication middleware" with includeLinked: true
+
+Results are tagged with `[project-name]` labels showing which project each result came from. The current project always has highest priority for deduplication — if the same file exists in multiple linked projects, the current project's version wins.
+
+> **Note:** Each linked project must be independently indexed (`codebase_index`) before it can be searched.
+
+### Branch-Aware Indexing
+
+By default, all branches of a project share the same index. When you switch branches, changed files are re-indexed by the watcher, and the index reflects the current branch state.
+
+For workflows where you need **separate, persistent indexes per branch** — such as CI/CD pipelines or comparing code across branches — enable branch-aware mode:
+
+```bash
+SOCRATICODE_BRANCH_AWARE=true
+```
+
+With this enabled, collection names include the branch name (e.g. `codebase_abc123__main`, `codebase_abc123__feat_my-feature`). Each branch maintains its own independent index, code graph, and context artifacts.
+
+**When to use:**
+- CI/CD pipelines that index each branch/PR separately
+- Comparing search results across branches
+- Keeping a pristine `main` index unaffected by feature branch changes
+
+**When NOT to use:**
+- Local development with frequent branch switching (default shared index is more efficient)
+- Projects tracked via `SOCRATICODE_PROJECT_ID` (explicit IDs bypass branch detection)
+
+> **How it works:** `projectIdFromPath()` detects the current git branch via `git rev-parse --abbrev-ref HEAD` and appends a sanitized branch suffix (e.g. `feat/my-feature` → `feat_my-feature`) to the hash-based project ID. Detached HEAD states fall back to the branchless ID.
+
 ### Available tools
 
 Once connected, 21 tools are available to your AI assistant:
@@ -564,7 +804,7 @@ Once connected, 21 tools are available to your AI assistant:
 
 | Tool | Description |
 |------|-------------|
-| `codebase_search` | Hybrid semantic + keyword search (dense + BM25, RRF-fused) with optional file path and language filters |
+| `codebase_search` | Hybrid semantic + keyword search (dense + BM25, RRF-fused) with optional file path, language filters, and cross-project search (`includeLinked`) |
 | `codebase_status` | Check index status and chunk count |
 
 #### Code Graph
@@ -575,9 +815,36 @@ Once connected, 21 tools are available to your AI assistant:
 | `codebase_graph_query` | Query imports and dependents for a specific file |
 | `codebase_graph_stats` | Get graph statistics (most connected files, orphans, language breakdown) |
 | `codebase_graph_circular` | Detect circular dependencies |
-| `codebase_graph_visualize` | Generate a Mermaid diagram of the dependency graph |
+| `codebase_graph_visualize` | Generate a Mermaid diagram (`mode=mermaid`, default) or an interactive HTML explorer (`mode=interactive`) of the dependency graph. Interactive mode writes a self-contained page (vendored Cytoscape.js + Dagre, works offline) and opens it in your default browser — file + symbol views, blast-radius overlay, live search, PNG export. |
 | `codebase_graph_status` | Check graph build progress or persisted graph metadata |
 | `codebase_graph_remove` | Remove a project's persisted code graph (waits for in-flight graph build to finish first) |
+
+#### Impact Analysis (symbol-level call graph)
+
+A second graph layer goes one step deeper than file imports — it tracks which functions
+and methods call which. Use these tools BEFORE refactoring, renaming, or deleting code.
+
+| Tool | Description |
+|------|-------------|
+| `codebase_impact` | Blast radius — what files break if you change file/function X (BFS through reverse-call edges) |
+| `codebase_flow` | Trace forward execution flow from an entry point. Call with no args to discover entry points (orphans, `main()`, framework routes, tests) |
+| `codebase_symbol` | 360° view of one symbol — its definition, callers, and callees |
+| `codebase_symbols` | List symbols in a file or search by name across the project |
+
+> **Accepted limits.** The call graph is static-analysis-based — no type inference. Dynamic dispatch (`getattr`, `obj[key](...)`, reflection, `eval`), unexpanded macros, and framework magic (Spring `@Autowired`, Angular DI, Rails `has_many`, decorator-driven routing) are invisible. Callers that reach a method only through these mechanisms will not appear in `codebase_impact`. Treat "zero callers" as a hint to double-check on DI-heavy codebases. `codebase_graph_status` reports `unresolvedEdgePct` as a quality signal. See [DEVELOPER.md § Impact Analysis](DEVELOPER.md) for the full list.
+
+#### Interactive graph explorer
+
+Ask your AI *"show me an interactive graph of this project"* (or invoke `codebase_graph_visualize` with `mode: "interactive"`) and SocratiCode generates a self-contained HTML page and opens it in your default browser:
+
+- **File view** — every source file as a node, imports as edges, language-coloured, circular deps in red.
+- **Symbol view** — toggle to see functions/classes/methods as nodes with call edges (available when the symbol graph fits within the embed cap; above that threshold the file view remains and the banner points at `codebase_impact` for symbol-level queries).
+- **Sidebar** — click a node to see imports / dependents / symbols-in-file / line numbers, with action buttons for blast radius and call flow.
+- **Right-click any node** → highlights its reverse-transitive closure (who breaks if this changes).
+- **Live search** filters and centres matching nodes. **Layout switcher** — Dagre / force-directed / concentric / breadth-first / grid / circle. **Export PNG** produces a shareable image.
+- **Offline-safe** — Cytoscape.js + Dagre are vendored inside the SocratiCode package. No CDN, no network, works in air-gapped environments.
+
+The output is a single HTML file (written to the OS temp dir, one per project) that you can also commit to a PR or share on Slack.
 
 #### Management
 
@@ -670,6 +937,56 @@ Artifacts are chunked and embedded into Qdrant using the same hybrid dense + BM2
 3. **Re-index**: `codebase_context_index` — force re-index (usually not needed, auto-indexing handles it)
 4. **Clean up**: `codebase_context_remove` — remove all indexed artifacts
 
+### Why this matters: real workflow examples
+
+Without artifacts, the agent only sees source code. With artifacts, it has the full picture and writes code that fits your project from the start.
+
+**Database schema** — You ask *"add a last_login timestamp to users."* The agent runs `codebase_context_search` for "users table", finds the schema uses `snake_case` columns and every table has an `updated_at` with a trigger. The migration it writes matches existing conventions instead of guessing.
+
+```json
+{
+  "name": "database-schema",
+  "path": "./docs/schema.sql",
+  "description": "Complete PostgreSQL schema — all tables, columns, types, constraints, indexes, and triggers. Check this before writing migrations to match naming conventions and existing patterns."
+}
+```
+
+**API spec** — You ask *"add a GET endpoint for user preferences."* The agent searches the OpenAPI spec, sees all endpoints use Bearer auth, return `{ data, meta }` wrappers, and paginate with `cursor`/`limit`. The new endpoint follows the same patterns automatically.
+
+```json
+{
+  "name": "api-spec",
+  "path": "./docs/openapi.yaml",
+  "description": "OpenAPI 3.0 spec for the REST API — all endpoints, request/response schemas, auth, pagination. Check this before adding or modifying endpoints to match existing conventions."
+}
+```
+
+**Domain glossary (DDD)** — You ask *"add a way to cancel an order."* The agent searches your domain glossary, finds that cancellation is modeled as an `OrderVoided` event (not "cancelled"), that only orders in `Confirmed` status can be voided, and that the `Fulfillment` bounded context must be notified. The implementation uses the correct domain terms and integrates with the right bounded contexts.
+
+```json
+{
+  "artifacts": [
+    {
+      "name": "ubiquitous-language",
+      "path": "./docs/ubiquitous-language.md",
+      "description": "Domain glossary — bounded context terms, their definitions, and relationships. Always check this before naming entities, events, or commands to use the correct domain language."
+    },
+    {
+      "name": "context-map",
+      "path": "./docs/context-mapping.md",
+      "description": "Bounded context map — context boundaries, relationships (shared kernel, customer-supplier, etc.), and integration patterns. Check before implementing cross-context communication."
+    },
+    {
+      "name": "event-storming",
+      "path": "./docs/event-storming/",
+      "description": "Event storming output — domain events, commands, aggregates, policies, and read models. Check before adding new domain behaviour to see how it fits the existing event flows."
+    }
+  ]
+}
+```
+
+> **The `description` field is the key lever.** It tells the AI not just *what* the artifact is, but *when to consult it*. Write descriptions that say "check this before doing X" so the agent reaches for the artifact at the right moment.
+
 ### Example artifacts
 
 | Category | Examples |
@@ -684,6 +1001,64 @@ Artifacts are chunked and embedded into Qdrant using the same hybrid dense + BM2
 > **Tip**: For database schemas, every major database can export its entire schema to a single file: `pg_dump --schema-only` (PostgreSQL), `mysqldump --no-data` (MySQL), `sqlite3 db.sqlite .schema` (SQLite). ORM schemas (Prisma, Rails, Django) are often already in your repo.
 
 ## Environment Variables
+
+SocratiCode reads configuration from environment variables. The way you pass them depends on your MCP host — the key name and file format differ across the three main config flavours. If env vars appear to be ignored, check the host's config format first — most "it's not picking up my settings" issues are a mismatched key.
+
+### Passing env vars by host
+
+| Host | Config file | Env-var syntax |
+|------|-------------|---------|
+| Claude Code / Claude Desktop / Windsurf / Cline / Roo Code / Cursor / VS Code Copilot | MCP JSON (`mcpServers` or `servers`) | `"env": { "KEY": "value" }` |
+| **OpenCode** | `opencode.json` / `opencode.jsonc` ([schema](https://opencode.ai/config.json)) | **`"environment": { "KEY": "value" }`** — *not* `"env"`, which is silently ignored |
+| **OpenAI Codex CLI** | `~/.codex/config.toml` ([reference](https://developers.openai.com/codex/config-reference/)) | **Nested TOML table** — a `[mcp_servers.NAME.env]` block with `KEY = "value"` lines. Inline `env = { ... }` is *not* the Codex form. |
+
+Worked examples with a few env vars set:
+
+**Standard MCP JSON** — Claude Code, Claude Desktop, Windsurf, Cline, Roo Code, Cursor, VS Code Copilot:
+
+```json
+"socraticode": {
+  "command": "npx",
+  "args": ["-y", "socraticode"],
+  "env": {
+    "QDRANT_MODE": "external",
+    "QDRANT_URL": "https://xyz.qdrant.io"
+  }
+}
+```
+
+**OpenCode** — note `environment`, not `env`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "socraticode": {
+      "type": "local",
+      "command": ["npx", "-y", "socraticode"],
+      "enabled": true,
+      "environment": {
+        "QDRANT_MODE": "external",
+        "QDRANT_URL": "https://xyz.qdrant.io"
+      }
+    }
+  }
+}
+```
+
+**OpenAI Codex CLI** — env vars go in a separate `[mcp_servers.NAME.env]` table:
+
+```toml
+[mcp_servers.socraticode]
+command = "npx"
+args = ["-y", "socraticode"]
+
+[mcp_servers.socraticode.env]
+QDRANT_MODE = "external"
+QDRANT_URL = "https://xyz.qdrant.io"
+```
+
+The rest of this section documents the variables themselves. Pass them using whichever syntax matches your host.
 
 ### Embedding Provider
 
@@ -720,9 +1095,9 @@ Artifacts are chunked and embedded into Qdrant using the same hybrid dense + BM2
 | `QDRANT_PORT` | `16333` | Qdrant REST API port (managed mode, or external without `QDRANT_URL`) |
 | `QDRANT_GRPC_PORT` | `16334` | Qdrant gRPC port (managed mode only) |
 | `QDRANT_HOST` | `localhost` | Qdrant hostname (alternative to `QDRANT_URL` for non-HTTPS external instances) |
-| `QDRANT_API_KEY` | *(none)* | Qdrant API key (required for Qdrant Cloud and other authenticated deployments) |
+| `QDRANT_API_KEY` | *(none)* | Qdrant API key (required for Qdrant Cloud and other authenticated deployments). When set, the URL must be `https://...` so the key is not transmitted over plain HTTP. Loopback URLs (`localhost`, `127.0.0.1`, `[::1]`) are accepted on `http://` for local development. |
 
-### Indexing Behavior
+### Indexing Behaviour
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -733,6 +1108,8 @@ Artifacts are chunked and embedded into Qdrant using the same hybrid dense + BM2
 | `SEARCH_DEFAULT_LIMIT` | `10` | Default number of results returned by `codebase_search` (1-50). Each result is a ranked code chunk with file path, line range, and content. Higher values give broader coverage but produce more output. Can still be overridden per-query via the `limit` tool parameter. |
 | `SEARCH_MIN_SCORE` | `0.10` | Minimum RRF (Reciprocal Rank Fusion) score threshold (0-1). Results below this score are filtered out. Helps remove low-relevance noise from search results. Set to `0` to disable filtering (returns all results up to `limit`). Can be overridden per-query via the `minScore` tool parameter. Works together with `limit`: results are first filtered by score, then capped at `limit`. |
 | `SOCRATICODE_PROJECT_ID` | *(none)* | Override the auto-generated project ID. When set, all paths resolve to the same Qdrant collections, allowing multiple directories (e.g. git worktrees of the same repo) to share a single index. Must match `[a-zA-Z0-9_-]+`. |
+| `SOCRATICODE_BRANCH_AWARE` | `false` | When `true`, append the current git branch name to the project ID, creating separate Qdrant collections per branch. Ignored when `SOCRATICODE_PROJECT_ID` is set. |
+| `SOCRATICODE_LINKED_PROJECTS` | *(none)* | Comma-separated list of additional project paths to include in cross-project search. Merged with paths from `.socraticode.json`. Non-existent paths are silently skipped. |
 | `SOCRATICODE_LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, `error` |
 | `SOCRATICODE_LOG_FILE` | *(none)* | Absolute path to a log file. When set, all log entries are appended to this file (a session separator is written on each server start). Useful for debugging when the MCP host doesn't surface log notifications. |
 
@@ -825,9 +1202,9 @@ Running a head-to-head comparison against the VS Code codebase (~2.45 million li
 
 ### When hybrid search wins
 
-**Natural-language and conceptual queries** — Queries like *"Where do we handle database connection pooling?"* or *"How does this library implement exponential backoff?"* describe behavior rather than naming a function. Evaluations on repository-level benchmarks (RepoEval, SWE-bench) show that AST-aware semantic retrieval improves recall by up to 4.3 points and downstream code-generation accuracy by ~2.7 points compared to fixed line-based chunks. Agentic evaluations on real open-source repos show a 70% win rate for hybrid search over vanilla grep on hard, conceptual questions — with 56% fewer search operations and ~60,000 fewer tokens per complex query.
+**Natural-language and conceptual queries** — Queries like *"Where do we handle database connection pooling?"* or *"How does this library implement exponential backoff?"* describe behaviour rather than naming a function. Evaluations on repository-level benchmarks (RepoEval, SWE-bench) show that AST-aware semantic retrieval improves recall by up to 4.3 points and downstream code-generation accuracy by ~2.7 points compared to fixed line-based chunks. Agentic evaluations on real open-source repos show a 70% win rate for hybrid search over vanilla grep on hard, conceptual questions — with 56% fewer search operations and ~60,000 fewer tokens per complex query.
 
-**Large repos and monorepos** — At multi-million LOC scale, full-text scans become expensive. Production search engines report ~20% relevance improvement from BM25F ranking over previous approaches, and use it as the first-stage retriever for semantic reranking. Hybrid search backed by inverted and vector indexes avoids full scans entirely, making it both faster and more precise at scale. Industry practitioners explicitly note that grep and find "don't scale well to millions of files" and that optimized embedding-based indexes can be faster at that scale.
+**Large repos and monorepos** — At multi-million LOC scale, full-text scans become expensive. Production search engines report ~20% relevance improvement from BM25F ranking over previous approaches, and use it as the first-stage retriever for semantic reranking. Hybrid search backed by inverted and vector indexes avoids full scans entirely, making it both faster and more precise at scale. Industry practitioners explicitly note that grep and find "don't scale well to millions of files" and that optimised embedding-based indexes can be faster at that scale.
 
 **Cross-file and cross-language reasoning** — Finding all code paths that eventually call an internal helper across services, or mapping a natural-language spec to implementations in Go and SQL, requires understanding that goes beyond string matching. Evaluations show that hybrid pipelines with tree-sitter parsing and dependency context outperform grep when naming is non-obvious and semantic understanding is needed. AST-based chunking with learned retrievers improves retrieval in cross-language benchmarks, and multi-vector semantic models show large gains over BM25 alone across diverse code search tasks (AppsRetrieval, CodeSearchNet, CosQA) where queries are in natural language and targets span many languages.
 
@@ -939,6 +1316,35 @@ model. Projects you haven't touched are unaffected.
 The code you see behind Socrates is part of the original Apollo 11 guidance computer (AGC) source code for Command Module (Comanche055)!
 
 
+## Community
+
+- 💬 **[Discord](https://discord.gg/5DrMXfNG)** — chat with users and maintainers, ask "how do I…", share what you're building
+- 🐛 **[GitHub Issues](https://github.com/giancarloerra/socraticode/issues)** — bug reports and confirmed feature requests (please use the templates)
+- 📣 **Releases** — *Watch* the repo (top-right on GitHub → *Custom* → *Releases*) to be notified of new versions
+
+If SocratiCode is useful to you, the single most helpful thing you can do is ⭐ **star the repo** — it's how others discover the project.
+
+---
+
+## SocratiCode Cloud
+
+The full SocratiCode engine is — and will remain — free and open-source under AGPL-3.0. **SocratiCode Cloud** is an optional hosted version on top of the same engine, currently in **private beta**, for teams that want shared, managed, compliant infrastructure.
+
+What Cloud adds on top of the OSS engine:
+
+- **Shared team index** — every developer searches the same data, auto-indexed on every push across every branch
+- **Cross-repo search** — query every repository your organisation owns in one call
+- **SSO / SAML, audit logs, IP allowlisting** — built in, not a later upsell
+- **Deployment models** — managed cloud (EU/US), your own VPC (AWS/GCP/Azure), or fully air-gapped on-prem
+- **Web dashboard** — search, dependency graphs, artefacts, team and repo management
+- **Zero local infrastructure** — no Docker, no Qdrant, no Ollama for the team to manage
+
+Currently onboarding a small number of engineering teams. **[Request early access →](https://socraticode.cloud)**
+
+> The open-source engine in this repository is and will always be the same engine that powers Cloud. No bait-and-switch, no feature gating of the OSS core. Cloud only adds the team, deployment and compliance layer around it.
+
+---
+
 ## License
 
 SocratiCode is dual-licensed:
@@ -947,7 +1353,7 @@ SocratiCode is dual-licensed:
   If you modify SocratiCode and offer it as a network service, you must release
   your modifications under AGPL-3.0.
 
-- **Commercial** — For organizations that need to use SocratiCode in proprietary
+- **Commercial** — For organisations that need to use SocratiCode in proprietary
   products or services without AGPL obligations. See [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL)
   or contact [giancarlo@altaire.com](mailto:giancarlo@altaire.com).
 

@@ -3,7 +3,7 @@ name: codebase-explorer
 description: >-
   Deep codebase exploration using SocratiCode. Combines semantic search,
   dependency graphs, and context artifacts to answer questions about code
-  structure and behavior. Use when delegating complex codebase understanding
+  structure and behaviour. Use when delegating complex codebase understanding
   tasks that require tracing through multiple files and dependencies.
 
   <example>
@@ -17,8 +17,6 @@ description: >-
   user: "Give me an overview of this project's architecture"
   assistant: "I'll use the codebase-explorer agent for a deep architectural analysis."
   </example>
-model: sonnet
-allowed-tools: Read, Grep, Glob, Bash(git *)
 ---
 
 You are a codebase exploration specialist. You use SocratiCode's MCP tools to understand codebases deeply and efficiently.
@@ -37,7 +35,7 @@ Never open a file just to check if it's relevant. Always search first.
 
 4. **Read files only after narrowing down.** Once search results point to 1-3 specific files, read the relevant sections.
 
-5. **Check for architectural issues.** Use `codebase_graph_circular` to detect circular dependencies when debugging unexpected behavior.
+5. **Check for architectural issues.** Use `codebase_graph_circular` to detect circular dependencies when debugging unexpected behaviour.
 
 6. **Synthesize findings.** Present clear, structured answers with specific file paths and line references. Explain the relationships between components.
 

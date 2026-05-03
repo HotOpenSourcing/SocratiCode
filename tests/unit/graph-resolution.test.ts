@@ -5,7 +5,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { resolveImport } from "../../src/services/graph-resolution.js";
+import {
+  buildCsNamespaceMap,
+  buildJvmSuffixMap,
+  resolveImport,
+} from "../../src/services/graph-resolution.js";
 
 // ── Helper to create temp project layouts ─────────────────────────────
 
@@ -691,10 +695,10 @@ describe("graph-resolution", () => {
   // ── C# resolution ─────────────────────────────────────────────────────
 
   describe("C# resolution", () => {
-    it("returns null (namespaces don't map to files)", () => {
+    it("returns null when no namespace map is supplied (back-compat)", () => {
       project = createTempProject({
-        "Models/User.cs": "",
-        "Program.cs": "",
+        "Models/User.cs": "namespace MyApp.Models { public class User {} }",
+        "Program.cs": "using MyApp.Models;",
       });
 
       const result = resolveImport(
@@ -706,6 +710,240 @@ describe("graph-resolution", () => {
       );
 
       expect(result).toBeNull();
+    });
+
+    it("resolves a using directive to a file via the namespace map", () => {
+      project = createTempProject({
+        "Models/User.cs": "namespace MyApp.Models { public class User {} }",
+        "Program.cs": "using MyApp.Models;\nnamespace MyApp { class Program {} }",
+      });
+
+      const csNamespaceMap = buildCsNamespaceMap(project.fileSet, project.root);
+      const result = resolveImport(
+        "MyApp.Models",
+        path.join(project.root, "Program.cs"),
+        project.root,
+        project.fileSet,
+        "csharp",
+        undefined,
+        undefined,
+        csNamespaceMap,
+      );
+
+      expect(result).toBe("Models/User.cs");
+    });
+
+    it("returns the first candidate when a namespace spans multiple files", () => {
+      project = createTempProject({
+        "Services/UserService.cs":
+          "namespace MyApp.Services { public class UserService {} }",
+        "Services/OrderService.cs":
+          "namespace MyApp.Services { public class OrderService {} }",
+        "Program.cs": "using MyApp.Services;",
+      });
+
+      const csNamespaceMap = buildCsNamespaceMap(project.fileSet, project.root);
+      const result = resolveImport(
+        "MyApp.Services",
+        path.join(project.root, "Program.cs"),
+        project.root,
+        project.fileSet,
+        "csharp",
+        undefined,
+        undefined,
+        csNamespaceMap,
+      );
+
+      // Multi-file namespaces resolve to the first registered file. Files are
+      // visited in lexicographic order, so OrderService.cs precedes
+      // UserService.cs. Multi-file fan-out is a known follow-up.
+      expect(result).toBe("Services/OrderService.cs");
+    });
+
+    it("returns null for unknown namespaces even with a populated map", () => {
+      project = createTempProject({
+        "Models/User.cs": "namespace MyApp.Models { public class User {} }",
+        "Program.cs": "using MyApp.Unknown;",
+      });
+
+      const csNamespaceMap = buildCsNamespaceMap(project.fileSet, project.root);
+      const result = resolveImport(
+        "MyApp.Unknown",
+        path.join(project.root, "Program.cs"),
+        project.root,
+        project.fileSet,
+        "csharp",
+        undefined,
+        undefined,
+        csNamespaceMap,
+      );
+
+      expect(result).toBeNull();
+    });
+
+    it("filters System.* and Microsoft.* as external before consulting the map", () => {
+      project = createTempProject({
+        "Program.cs": "namespace System.Collections { class Stub {} }",
+      });
+
+      const csNamespaceMap = buildCsNamespaceMap(project.fileSet, project.root);
+      const result = resolveImport(
+        "System.Collections",
+        path.join(project.root, "Program.cs"),
+        project.root,
+        project.fileSet,
+        "csharp",
+        undefined,
+        undefined,
+        csNamespaceMap,
+      );
+
+      expect(result).toBeNull();
+    });
+  });
+
+  // ── buildCsNamespaceMap ───────────────────────────────────────────────
+
+  describe("buildCsNamespaceMap", () => {
+    it("indexes block-scoped namespace declarations in lexicographic order", () => {
+      project = createTempProject({
+        "Models/User.cs": "namespace MyApp.Models { public class User {} }",
+        "Models/Order.cs": "namespace MyApp.Models { public class Order {} }",
+      });
+
+      const map = buildCsNamespaceMap(project.fileSet, project.root);
+      // Files are sorted lexically, so Order.cs comes before User.cs.
+      expect(map.get("MyApp.Models")).toEqual([
+        "Models/Order.cs",
+        "Models/User.cs",
+      ]);
+    });
+
+    it("returns the same candidate order regardless of fileSet insertion order", () => {
+      // Build two projects on the same physical layout but feed buildCsNamespaceMap
+      // a Set populated in two different orders, mimicking how fs.readdir() can
+      // hand back entries in arbitrary order across filesystems.
+      project = createTempProject({
+        "Services/UserService.cs":
+          "namespace MyApp.Services { public class UserService {} }",
+        "Services/OrderService.cs":
+          "namespace MyApp.Services { public class OrderService {} }",
+        "Services/AccountService.cs":
+          "namespace MyApp.Services { public class AccountService {} }",
+      });
+
+      const forward = new Set([
+        "Services/AccountService.cs",
+        "Services/OrderService.cs",
+        "Services/UserService.cs",
+      ]);
+      const reverse = new Set([
+        "Services/UserService.cs",
+        "Services/OrderService.cs",
+        "Services/AccountService.cs",
+      ]);
+
+      const a = buildCsNamespaceMap(forward, project.root);
+      const b = buildCsNamespaceMap(reverse, project.root);
+
+      expect(a.get("MyApp.Services")).toEqual(b.get("MyApp.Services"));
+      expect(a.get("MyApp.Services")?.[0]).toBe("Services/AccountService.cs");
+    });
+
+    it("indexes file-scoped namespace declarations (C# 10+)", () => {
+      project = createTempProject({
+        "Services/UserService.cs":
+          "namespace MyApp.Services;\n\npublic class UserService {}",
+      });
+
+      const map = buildCsNamespaceMap(project.fileSet, project.root);
+      expect(map.get("MyApp.Services")).toEqual(["Services/UserService.cs"]);
+    });
+
+    it("registers multiple namespaces declared in the same file", () => {
+      project = createTempProject({
+        "Mixed.cs":
+          "namespace MyApp.A { class A {} }\nnamespace MyApp.B { class B {} }",
+      });
+
+      const map = buildCsNamespaceMap(project.fileSet, project.root);
+      expect(map.get("MyApp.A")).toEqual(["Mixed.cs"]);
+      expect(map.get("MyApp.B")).toEqual(["Mixed.cs"]);
+    });
+
+    it("does not match commented-out namespace lines", () => {
+      project = createTempProject({
+        "Program.cs":
+          "// namespace MyApp.Hidden;\nnamespace MyApp.Real { class C {} }",
+      });
+
+      const map = buildCsNamespaceMap(project.fileSet, project.root);
+      expect(map.has("MyApp.Hidden")).toBe(false);
+      expect(map.get("MyApp.Real")).toEqual(["Program.cs"]);
+    });
+
+    it("ignores non-.cs files", () => {
+      project = createTempProject({
+        "notes.txt": "namespace Fake.Namespace;",
+        "Program.cs": "namespace Real.Namespace { class C {} }",
+      });
+
+      const map = buildCsNamespaceMap(project.fileSet, project.root);
+      expect(map.has("Fake.Namespace")).toBe(false);
+      expect(map.get("Real.Namespace")).toEqual(["Program.cs"]);
+    });
+
+    it("returns an empty map for a project with no .cs files", () => {
+      project = createTempProject({ "index.ts": "", "style.css": "" });
+      const map = buildCsNamespaceMap(project.fileSet, project.root);
+      expect(map.size).toBe(0);
+    });
+
+    it("does not duplicate the same file when re-indexed", () => {
+      project = createTempProject({
+        "Dup.cs": "namespace MyApp.X { class A {} }\nnamespace MyApp.X { class B {} }",
+      });
+
+      const map = buildCsNamespaceMap(project.fileSet, project.root);
+      expect(map.get("MyApp.X")).toEqual(["Dup.cs"]);
+    });
+
+    it("captures nested namespace declarations indented inside an outer block", () => {
+      project = createTempProject({
+        "Nested.cs":
+          "namespace Outer\n{\n    namespace Inner\n    {\n        class C {}\n    }\n}\n",
+      });
+
+      const map = buildCsNamespaceMap(project.fileSet, project.root);
+      expect(map.get("Outer")).toEqual(["Nested.cs"]);
+      expect(map.get("Inner")).toEqual(["Nested.cs"]);
+    });
+
+    it("rejects identifiers that do not start with a letter or underscore", () => {
+      project = createTempProject({
+        // Invalid C# (digit-leading), should not be captured.
+        "Bad.cs": "namespace 1Foo { class C {} }",
+        // Valid neighbour to make sure the scan still works.
+        "Good.cs": "namespace Real.NS { class C {} }",
+      });
+
+      const map = buildCsNamespaceMap(project.fileSet, project.root);
+      expect(map.has("1Foo")).toBe(false);
+      expect(map.get("Real.NS")).toEqual(["Good.cs"]);
+    });
+
+    it("requires a `;` or `{` after the namespace name to avoid false positives", () => {
+      project = createTempProject({
+        // The token `namespace MyApp.Hint` appears here but is not a real
+        // declaration (no terminator), so it must not be captured. The
+        // real declaration on the next line should be captured.
+        "Mixed.cs":
+          "// see also: namespace MyApp.Hint in legacy code\nnamespace MyApp.Real { class C {} }",
+      });
+
+      const map = buildCsNamespaceMap(project.fileSet, project.root);
+      expect(map.has("MyApp.Hint")).toBe(false);
+      expect(map.get("MyApp.Real")).toEqual(["Mixed.cs"]);
     });
   });
 
@@ -1201,6 +1439,130 @@ describe("graph-resolution", () => {
         project.root,
         project.fileSet,
         "css",
+      );
+
+      expect(result).toBeNull();
+    });
+  });
+
+  // ── buildJvmSuffixMap + multi-module resolution ──────────────────────────
+
+  describe("JVM multi-module resolution (buildJvmSuffixMap)", () => {
+    it("builds a suffix map keyed by class path after src/main/java", () => {
+      project = createTempProject({
+        [`module-a${path.sep}sub${path.sep}src${path.sep}main${path.sep}java${path.sep}com${path.sep}example${path.sep}Foo.java`]: "",
+        [`module-b${path.sep}src${path.sep}main${path.sep}kotlin${path.sep}com${path.sep}example${path.sep}Bar.kt`]: "",
+        [`module-c${path.sep}src${path.sep}main${path.sep}scala${path.sep}com${path.sep}example${path.sep}Baz.scala`]: "",
+      });
+
+      const map = buildJvmSuffixMap(project.fileSet);
+
+      expect(map.has(`com${path.sep}example${path.sep}Foo.java`)).toBe(true);
+      expect(map.has(`com${path.sep}example${path.sep}Bar.kt`)).toBe(true);
+      expect(map.has(`com${path.sep}example${path.sep}Baz.scala`)).toBe(true);
+    });
+
+    it("returns empty map when project has no JVM files", () => {
+      project = createTempProject({ "index.ts": "", "style.css": "" });
+      const map = buildJvmSuffixMap(project.fileSet);
+      expect(map.size).toBe(0);
+    });
+
+    it("ignores JVM files outside src/main/<lang> (e.g. test sources)", () => {
+      project = createTempProject({
+        // test source — should be ignored
+        [`module-a${path.sep}src${path.sep}test${path.sep}java${path.sep}com${path.sep}example${path.sep}FooTest.java`]: "",
+        // main source — should be registered
+        [`module-a${path.sep}src${path.sep}main${path.sep}java${path.sep}com${path.sep}example${path.sep}Foo.java`]: "",
+      });
+
+      const map = buildJvmSuffixMap(project.fileSet);
+      expect(map.has(`com${path.sep}example${path.sep}Foo.java`)).toBe(true);
+      expect(map.has(`com${path.sep}example${path.sep}FooTest.java`)).toBe(false);
+    });
+
+    it("resolves a Java import in a multi-module Maven project via suffix map", () => {
+      // Simulate: module-sso/module-sso-service/src/main/java/cn/sino/sso/UserService.java
+      const userServicePath =
+        `module-sso${path.sep}module-sso-service${path.sep}src${path.sep}main${path.sep}java${path.sep}cn${path.sep}sino${path.sep}sso${path.sep}UserService.java`;
+      const callerPath =
+        `module-opt${path.sep}src${path.sep}main${path.sep}java${path.sep}cn${path.sep}sino${path.sep}opt${path.sep}Service.java`;
+
+      project = createTempProject({
+        [userServicePath]: "",
+        [callerPath]: "",
+      });
+
+      const jvmSuffixMap = buildJvmSuffixMap(project.fileSet);
+
+      const result = resolveImport(
+        "cn.sino.sso.UserService",
+        path.join(project.root, callerPath),
+        project.root,
+        project.fileSet,
+        "java",
+        undefined,
+        jvmSuffixMap,
+      );
+
+      expect(result).toBe(userServicePath);
+    });
+
+    it("resolves Kotlin import in multi-module project via suffix map", () => {
+      const barPath =
+        `module-core${path.sep}src${path.sep}main${path.sep}kotlin${path.sep}com${path.sep}example${path.sep}Bar.kt`;
+      const callerPath =
+        `module-api${path.sep}src${path.sep}main${path.sep}kotlin${path.sep}com${path.sep}example${path.sep}Caller.kt`;
+
+      project = createTempProject({ [barPath]: "", [callerPath]: "" });
+
+      const jvmSuffixMap = buildJvmSuffixMap(project.fileSet);
+      const result = resolveImport(
+        "com.example.Bar",
+        path.join(project.root, callerPath),
+        project.root,
+        project.fileSet,
+        "kotlin",
+        undefined,
+        jvmSuffixMap,
+      );
+
+      expect(result).toBe(barPath);
+    });
+
+    it("returns null when class exists nowhere in the project", () => {
+      project = createTempProject({
+        [`module-a${path.sep}src${path.sep}main${path.sep}java${path.sep}com${path.sep}example${path.sep}Foo.java`]: "",
+      });
+
+      const jvmSuffixMap = buildJvmSuffixMap(project.fileSet);
+      const result = resolveImport(
+        "com.example.NonExistent",
+        path.join(project.root, `module-a${path.sep}src${path.sep}main${path.sep}java${path.sep}com${path.sep}example${path.sep}Foo.java`),
+        project.root,
+        project.fileSet,
+        "java",
+        undefined,
+        jvmSuffixMap,
+      );
+
+      expect(result).toBeNull();
+    });
+
+    it("still returns null for java stdlib even with suffix map", () => {
+      project = createTempProject({
+        [`module-a${path.sep}src${path.sep}main${path.sep}java${path.sep}java${path.sep}util${path.sep}List.java`]: "",
+      });
+
+      const jvmSuffixMap = buildJvmSuffixMap(project.fileSet);
+      const result = resolveImport(
+        "java.util.List",
+        path.join(project.root, `module-a${path.sep}src${path.sep}main${path.sep}java${path.sep}Caller.java`),
+        project.root,
+        project.fileSet,
+        "java",
+        undefined,
+        jvmSuffixMap,
       );
 
       expect(result).toBeNull();
