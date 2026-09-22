@@ -42,7 +42,10 @@ function ensureLockDir(): void {
 }
 
 function lockKey(projectPath: string, operation: string): string {
-  const projectId = projectIdFromPath(path.resolve(projectPath));
+  return identityLockKey(projectIdFromPath(path.resolve(projectPath)), operation);
+}
+
+function identityLockKey(projectId: string, operation: string): string {
   return `${projectId}-${operation}`;
 }
 
@@ -55,12 +58,41 @@ function lockFilePath(key: string): string {
  *
  * @param projectPath - Absolute path to the project directory
  * @param operation - Operation type: "index" or "watch"
+ * @param onCompromised - Called if the lock is lost while still held. The lock
+ *   guards a shared collection, so losing it means another process may now be
+ *   writing to what this one is still writing to; the caller is the only thing
+ *   that knows how to stand down. It runs from proper-lockfile's timer, where
+ *   nothing is waiting on it, so both a synchronous throw and a rejected
+ *   promise are logged and swallowed rather than becoming an unhandled
+ *   rejection.
  * @returns true if the lock was acquired, false if another process holds it
  */
-export async function acquireProjectLock(projectPath: string, operation: string): Promise<boolean> {
+export async function acquireProjectLock(
+  projectPath: string,
+  operation: string,
+  onCompromised?: (err: Error) => void | Promise<void>,
+  options: { reentrant?: boolean } = {},
+): Promise<boolean> {
+  return acquireIdentityLock(
+    projectIdFromPath(path.resolve(projectPath)),
+    operation,
+    onCompromised,
+    projectPath,
+    options.reentrant ?? true,
+  );
+}
+
+/** Reclamation addresses an identity whose directory may be gone, so it locks by identity, not path. */
+export async function acquireIdentityLock(
+  projectId: string,
+  operation: string,
+  onCompromised?: (err: Error) => void | Promise<void>,
+  projectPath: string = projectId,
+  reentrant = true,
+): Promise<boolean> {
   ensureLockDir();
 
-  const key = lockKey(projectPath, operation);
+  const key = identityLockKey(projectId, operation);
   const filePath = lockFilePath(key);
 
   // Ensure the file to lock exists (proper-lockfile requires it)
@@ -68,9 +100,9 @@ export async function acquireProjectLock(projectPath: string, operation: string)
     fs.writeFileSync(filePath, `${process.pid}\n`, "utf-8");
   }
 
-  // If we already hold this lock (same process), return true
+  // A lock this process holds belongs to whoever took it; a non-reentrant caller must not adopt it.
   if (heldLocks.has(key)) {
-    return true;
+    return reentrant;
   }
 
   try {
@@ -87,6 +119,21 @@ export async function acquireProjectLock(projectPath: string, operation: string)
           error: err.message,
         });
         heldLocks.delete(key);
+        const logHandlerFailure = (handlerErr: unknown) => {
+          logger.warn("Lock compromise handler failed", {
+            projectPath,
+            operation,
+            error: handlerErr instanceof Error ? handlerErr.message : String(handlerErr),
+          });
+        };
+        try {
+          // The handler is invoked synchronously, so a caller standing down
+          // takes effect immediately; only its rejection is deferred. A
+          // synchronous throw still reaches the catch below.
+          void Promise.resolve(onCompromised?.(err)).catch(logHandlerFailure);
+        } catch (handlerErr) {
+          logHandlerFailure(handlerErr);
+        }
       },
     });
 
@@ -115,13 +162,36 @@ export async function acquireProjectLock(projectPath: string, operation: string)
 }
 
 /**
+ * Whether this process still holds the lock for a project operation.
+ *
+ * `onCompromised` removes the entry when proper-lockfile reports the lock lost,
+ * so this answers false from the moment ownership is known to be gone. Callers
+ * use it to decide whether a write they were about to make is still theirs to
+ * make — once another process may hold the lock, the safe move is to stop
+ * rather than to correct, since a correction would overwrite the new holder.
+ */
+export function holdsProjectLock(projectPath: string, operation: string): boolean {
+  return heldLocks.has(lockKey(projectPath, operation));
+}
+
+/** Whether this process holds the lock for a recorded project identity. */
+export function holdsIdentityLock(projectId: string, operation: string): boolean {
+  return heldLocks.has(identityLockKey(projectId, operation));
+}
+
+/**
  * Release a previously acquired lock.
  *
  * @param projectPath - Absolute path to the project directory
  * @param operation - Operation type: "index" or "watch"
  */
 export async function releaseProjectLock(projectPath: string, operation: string): Promise<void> {
-  const key = lockKey(projectPath, operation);
+  return releaseIdentityLock(projectIdFromPath(path.resolve(projectPath)), operation, projectPath);
+}
+
+/** Release a lock acquired through {@link acquireIdentityLock}. */
+export async function releaseIdentityLock(projectId: string, operation: string, projectPath: string = projectId): Promise<void> {
+  const key = identityLockKey(projectId, operation);
   const release = heldLocks.get(key);
 
   if (release) {
@@ -145,20 +215,43 @@ export async function releaseProjectLock(projectPath: string, operation: string)
  * Check if a lock is currently held (by any process).
  */
 export async function isProjectLocked(projectPath: string, operation: string): Promise<boolean> {
-  ensureLockDir();
-
-  const key = lockKey(projectPath, operation);
-  const filePath = lockFilePath(key);
-
-  if (!fs.existsSync(filePath)) return false;
-
   try {
+    return await isProjectIdentityLocked(projectIdFromPath(path.resolve(projectPath)), operation);
+  } catch {
+    return false;
+  }
+}
+
+/** A lock whose state could not be read; a caller about to delete must treat it as held. */
+export class LockInspectionError extends Error {
+  constructor(
+    readonly projectId: string,
+    readonly operation: string,
+    cause: unknown,
+  ) {
+    super(`Could not inspect the ${operation} lock for ${projectId}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "LockInspectionError";
+  }
+}
+
+/** Check a lock by identity; throws LockInspectionError when the answer is unknown rather than answering false. */
+export async function isProjectIdentityLocked(projectId: string, operation: string): Promise<boolean> {
+  try {
+    ensureLockDir();
+    const filePath = lockFilePath(identityLockKey(projectId, operation));
+    try {
+      fs.statSync(filePath);
+    } catch (err) {
+      // Only a missing file means nobody holds the lock; an unreadable one says nothing.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw err;
+    }
     return await lockfile.check(filePath, {
       stale: STALE_MS,
       realpath: false,
     });
-  } catch {
-    return false;
+  } catch (err) {
+    throw new LockInspectionError(projectId, operation, err);
   }
 }
 

@@ -1,16 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import path from "node:path";
-import { mergeExtraExtensions, QDRANT_MODE } from "../constants.js";
-import { awaitGraphBuild, isGraphBuildInProgress } from "../services/code-graph.js";
+import { collectionName, projectIdFromPath } from "../config.js";
+import { getWatcherMode, mergeExtraExtensions, QDRANT_MODE } from "../constants.js";
+import { awaitGraphBuild, getGraphBuildInProgressProjects, invalidateGraphCache, invalidateGraphCacheForIdentity, isGraphBuildInProgress } from "../services/code-graph.js";
+import { getContextIndexingInProgressProjects } from "../services/context-artifacts.js";
 import type { InfraProgressCallback } from "../services/docker.js";
 import { ensureQdrantReady, isDockerAvailable } from "../services/docker.js";
-import { getEmbeddingConfig } from "../services/embedding-config.js";
-import { getEmbeddingProvider } from "../services/embedding-provider.js";
-import { getIndexingProgress, indexProject, isIndexingInProgress, removeProjectIndex, requestCancellation, setIndexingProgress, updateProjectIndex } from "../services/indexer.js";
-import { isProjectLocked, terminateLockHolder } from "../services/lock.js";
+import { ensureEffectiveEmbeddingReady } from "../services/index-profile.js";
+import { getIndexingInProgressProjects, getIndexingProgress, indexProject, invalidateProjectHashesForIdentity, isIndexingInProgress, removeProjectIndex, requestCancellation, setIndexingProgress, updateProjectIndex } from "../services/indexer.js";
+import { isProjectIdentityLocked, isProjectLocked, terminateLockHolder } from "../services/lock.js";
 import { logger } from "../services/logger.js";
-import { getWatchedProjects, isWatching, startWatching, stopWatching } from "../services/watcher.js";
+import {
+  getProjectReclamationInventory,
+  loadEffectiveIndexProfileForCollection,
+  type ProjectReclamationEntry,
+  removeProjectReclamationEntry,
+} from "../services/qdrant.js";
+import { acquireReclamationBarrier, WRITER_OPERATIONS } from "../services/reclamation-barrier.js";
+import { dropSymbolGraphCache } from "../services/symbol-graph-cache.js";
+import { resetSymbolGraphCollectionCache } from "../services/symbol-graph-store.js";
+import { getWatchedProjects, isWatching, startWatching, startWatchingAutomatically, stopWatching } from "../services/watcher.js";
 
 const DOCKER_NOT_AVAILABLE_MESSAGE = [
   "❌ Docker is not available.",
@@ -27,19 +37,23 @@ const DOCKER_NOT_AVAILABLE_MESSAGE = [
   "Run codebase_health for a full infrastructure diagnostic.",
 ].join("\n");
 
-async function ensureInfrastructure(onProgress?: InfraProgressCallback): Promise<string[]> {
+async function ensureInfrastructure(
+  projectPath: string,
+  onProgress?: InfraProgressCallback,
+): Promise<string[]> {
   const messages: string[] = [];
-  const config = getEmbeddingConfig();
 
   const docker = await ensureQdrantReady(onProgress);
   if (docker.pulled) messages.push("Pulled Qdrant Docker image.");
   if (docker.started) messages.push("Started Qdrant container.");
 
-  const provider = await getEmbeddingProvider(onProgress);
-  const readiness = await provider.ensureReady();
+  const resolvedPath = path.resolve(projectPath);
+  const collection = collectionName(projectIdFromPath(resolvedPath));
+  const profile = await loadEffectiveIndexProfileForCollection(collection);
+  const readiness = await ensureEffectiveEmbeddingReady(profile, onProgress);
   if (readiness.imagePulled) messages.push("Pulled Ollama Docker image.");
   if (readiness.containerStarted) messages.push("Started Ollama container.");
-  if (readiness.modelPulled) messages.push(`Pulled ${config.embeddingModel} model.`);
+  if (readiness.modelPulled) messages.push(`Pulled ${profile.embedding.model} model.`);
 
   return messages;
 }
@@ -59,6 +73,101 @@ function formatIndexingInProgressMessage(resolvedPath: string, requestedTool: st
 
   lines.push("", "Use codebase_status to check current indexing state.");
   return lines.join("\n");
+}
+
+function formatPruneInventory(): Promise<string> {
+  return getProjectReclamationInventory().then((inventory) => {
+    if (inventory.entries.length === 0 && inventory.unrecognisedMetadata.length === 0 && inventory.unattributedCollections.length === 0) {
+      return "No stored project identities found.";
+    }
+    const lines = [
+      "Stored project inventory:",
+      "",
+      "Path state is local observation only. An absent path on this host is not proof that an identity is stale: in a shared store the path may exist only where the index was written.",
+      "Apply requires the exact identity, its confirmation token, and acknowledgeNoRemoteWriters: true.",
+    ];
+    for (const entry of inventory.entries) {
+      lines.push("", `Identity: ${entry.identity}`);
+      lines.push(`  Path: ${entry.projectPath ?? "(unknown)"}`);
+      lines.push(`  Path state: ${entry.pathState}`);
+      if (entry.canonicalPath) lines.push(`  Canonical path: ${entry.canonicalPath}`);
+      lines.push(`  Collections: ${entry.resourceCollections.join(", ") || "(none)"}`);
+      for (const record of entry.metadataRecords) {
+        const facts = [
+          record.indexingStatus ? `status=${record.indexingStatus}` : null,
+          record.lastIndexedAt ? `indexed=${record.lastIndexedAt}` : null,
+          record.lastBuiltAt ? `built=${record.lastBuiltAt}` : null,
+          record.builtByVersion ? `by=${record.builtByVersion}` : null,
+          record.projectPath && record.projectPath !== entry.projectPath ? `path=${record.projectPath}` : null,
+        ].filter((fact) => fact !== null);
+        lines.push(`  Metadata: ${record.collectionName} [point ${record.pointId}]${facts.length ? ` ${facts.join(" ")}` : ""}`);
+      }
+      if (entry.inProgress) lines.push("  Indexing in progress: a metadata record is mid-write; deletion is refused until it completes");
+      if (entry.possibleSuperseded) lines.push("  Advisory: possible-superseded (another identity has this canonical path)");
+      for (const reason of entry.manualInspectionReasons) lines.push(`  Manual inspection required: ${reason}`);
+      lines.push(`  Confirmation token: ${entry.confirmationToken}`);
+    }
+    if (inventory.unrecognisedMetadata.length > 0) {
+      lines.push("", `${inventory.unrecognisedMetadata.length} metadata point${inventory.unrecognisedMetadata.length === 1 ? "" : "s"} could not be attributed to an identity and cannot be deleted by this tool:`);
+      for (const unrecognised of inventory.unrecognisedMetadata) {
+        lines.push(`  point ${unrecognised.pointId}: collectionName=${unrecognised.collectionName ?? "(none)"} projectPath=${unrecognised.projectPath ?? "(none)"} — ${unrecognised.reason}`);
+      }
+    }
+    if (inventory.unattributedCollections.length > 0) {
+      lines.push("", `${inventory.unattributedCollections.length} collection${inventory.unattributedCollections.length === 1 ? "" : "s"} could not be attributed to one identity and cannot be deleted by this tool:`);
+      for (const unattributed of inventory.unattributedCollections) {
+        lines.push(`  ${unattributed.name} — ${unattributed.reason}`);
+      }
+    }
+    return lines.join("\n");
+  });
+}
+
+/** Why a fresh inventory forbids deleting the identity, or null; activity is judged separately. */
+function pruneRefusal(entry: ProjectReclamationEntry | undefined, identity: string, confirmationToken: string): string | null {
+  if (!entry) return null;
+  if (entry.confirmationToken !== confirmationToken) {
+    return `Refusing to delete ${identity}: the inventory changed. Run codebase_prune again and use its new confirmation token.`;
+  }
+  if (entry.requiresManualInspection) {
+    return `Refusing to delete ${identity}: its identity cannot be established safely (${entry.manualInspectionReasons.join("; ")}).`;
+  }
+  if (entry.inProgress) {
+    return `Refusing to delete ${identity}: a metadata record reports indexing in progress.`;
+  }
+  return null;
+}
+
+function identityOfPath(projectPath: string): string | null {
+  try {
+    return projectIdFromPath(projectPath);
+  } catch {
+    return null;
+  }
+}
+
+/** What is writing to the identity, or null. Cross-process locks are read only before the barrier, which then holds them. */
+async function reclamationActivity(identity: string, storedPath: string | null, crossProcess: boolean): Promise<string | null> {
+  const resolvedStored = storedPath === null ? null : path.resolve(storedPath);
+  // Matched by stored path too, so a path-hash entry whose directory is now pinned is still caught.
+  const touches = (paths: string[]) => paths.some((candidate) => {
+    const resolved = path.resolve(candidate);
+    return resolved === resolvedStored || identityOfPath(resolved) === identity;
+  });
+  if (touches(getIndexingInProgressProjects())) return "indexing is in progress";
+  if (touches(getWatchedProjects())) return "a watcher is running";
+  if (touches(getGraphBuildInProgressProjects())) return "a graph build is in progress";
+  if (touches(getContextIndexingInProgressProjects())) return "context artifacts are being indexed";
+  if (crossProcess) {
+    for (const operation of WRITER_OPERATIONS) {
+      if (await isProjectIdentityLocked(identity, operation)) return `its ${operation} lock is held by another process`;
+    }
+  }
+  return null;
+}
+
+async function findPruneEntry(identity: string): Promise<ProjectReclamationEntry | undefined> {
+  return (await getProjectReclamationInventory()).entries.find((candidate) => candidate.identity === identity);
 }
 
 export async function handleIndexTool(
@@ -108,7 +217,7 @@ export async function handleIndexTool(
       // Infrastructure setup is synchronous — we need Docker/Ollama running before indexing
       let infraMessages: string[];
       try {
-        infraMessages = await ensureInfrastructure(infraProgress);
+        infraMessages = await ensureInfrastructure(resolved, infraProgress);
       } catch (error) {
         // Clear the progress on infra failure
         setIndexingProgress(resolved, null);
@@ -137,7 +246,7 @@ export async function handleIndexTool(
 
           // Auto-start watcher only if indexing completed (not cancelled)
           if (!result.cancelled && !isWatching(resolved)) {
-            const started = await startWatching(resolved);
+            const started = await startWatchingAutomatically(resolved);
             if (started) {
               logger.info("Auto-started file watcher", { projectPath: resolved });
             }
@@ -172,7 +281,7 @@ export async function handleIndexTool(
         return DOCKER_NOT_AVAILABLE_MESSAGE;
       }
 
-      const infraMessages = await ensureInfrastructure(onProgress);
+      const infraMessages = await ensureInfrastructure(resolved, onProgress);
       const updateExtraExts = mergeExtraExtensions(args.extraExtensions as string | undefined);
       const result = await updateProjectIndex(projectPath, onProgress, updateExtraExts.size > 0 ? updateExtraExts : undefined);
       const lines = [
@@ -189,7 +298,7 @@ export async function handleIndexTool(
 
       // Auto-start watcher after successful update (not cancelled)
       if (!result.cancelled && !isWatching(resolved)) {
-        const started = await startWatching(resolved);
+        const started = await startWatchingAutomatically(resolved);
         if (started) {
           logger.info("Auto-started file watcher after update", { projectPath: resolved });
         }
@@ -291,6 +400,78 @@ export async function handleIndexTool(
       return `Removed index for: ${projectPath}`;
     }
 
+    case "codebase_prune": {
+      if (args.apply !== true) return formatPruneInventory();
+      const identity = args.identity;
+      const confirmationToken = args.confirmationToken;
+      if (typeof identity !== "string" || typeof confirmationToken !== "string") {
+        return "Prune apply requires the exact identity and confirmationToken returned by codebase_prune.";
+      }
+      if (args.acknowledgeNoRemoteWriters !== true) {
+        return [
+          `Refusing to delete ${identity}: acknowledgeNoRemoteWriters is not true.`,
+          "Locks on this host cannot see an indexer on another host sharing this Qdrant. Confirm that no other host is writing to this identity, then pass acknowledgeNoRemoteWriters: true.",
+        ].join("\n");
+      }
+
+      const preview = await findPruneEntry(identity);
+      if (!preview) return `No resources remain for identity ${identity}. Nothing to delete.`;
+      const previewRefusal = pruneRefusal(preview, identity, confirmationToken);
+      if (previewRefusal) return previewRefusal;
+
+      let activity: string | null;
+      try {
+        activity = await reclamationActivity(identity, preview.projectPath, true);
+      } catch (err) {
+        return `Refusing to delete ${identity}: ${err instanceof Error ? err.message : String(err)}`;
+      }
+      if (activity) return `Refusing to delete ${identity}: ${activity}.`;
+
+      const barrier = await acquireReclamationBarrier(identity);
+      if (!barrier) return `Refusing to delete ${identity}: a writer holds one of its locks, or the reclamation barrier could not be taken.`;
+
+      try {
+        // Everything is judged again under the barrier: a writer that started
+        // after the checks above, or a record that changed, is caught here.
+        const entry = await findPruneEntry(identity);
+        if (!entry) return `No resources remain for identity ${identity}. Nothing to delete.`;
+        const refusal = pruneRefusal(entry, identity, confirmationToken);
+        if (refusal) return refusal;
+        const lateActivity = await reclamationActivity(identity, entry.projectPath, false);
+        if (lateActivity) return `Refusing to delete ${identity}: ${lateActivity}.`;
+        if (barrier.isCompromised()) return `Refusing to delete ${identity}: its reclamation barrier was lost to another process.`;
+
+        const outcomes = await removeProjectReclamationEntry(entry, () => !barrier.isCompromised());
+        const lostBarrier = barrier.isCompromised();
+        invalidateGraphCacheForIdentity(identity);
+        if (entry.projectPath) invalidateGraphCache(entry.projectPath);
+        invalidateProjectHashesForIdentity(identity);
+        dropSymbolGraphCache(identity);
+        resetSymbolGraphCollectionCache();
+
+        const remaining = await findPruneEntry(identity);
+        const leftover = remaining
+          ? [
+              ...remaining.resourceCollections.map((resource) => `collection ${resource}`),
+              ...remaining.metadataRecords.map((record) => `metadata ${record.collectionName} [point ${record.pointId}]`),
+            ]
+          : [];
+        const lines = outcomes.map((outcome) => `  ${outcome.outcome}: ${outcome.kind} ${outcome.resource}${outcome.error ? ` (${outcome.error})` : ""}`);
+        if (lostBarrier || outcomes.some((outcome) => outcome.outcome !== "deleted") || leftover.length > 0) {
+          return [
+            `Cleanup for ${identity} is incomplete.`,
+            ...(lostBarrier ? ["The reclamation barrier was lost during cleanup; deletion stopped at the first write after the loss."] : []),
+            ...lines,
+            ...(leftover.length > 0 ? ["Still stored after deletion:", ...leftover.map((item) => `  ${item}`)] : []),
+            "Inspect the inventory before retrying; a repeated apply with a fresh token is safe.",
+          ].join("\n");
+        }
+        return [`Removed all inventoried resources for identity: ${identity}`, ...lines].join("\n");
+      } finally {
+        await barrier.release();
+      }
+    }
+
     case "codebase_stop": {
       const resolved = path.resolve(projectPath);
 
@@ -339,9 +520,17 @@ export async function handleIndexTool(
 
     case "codebase_watch": {
       const action = args.action as string;
+      const watcherMode = getWatcherMode();
 
       if (action === "start") {
-        await ensureInfrastructure();
+        if (watcherMode === "off") {
+          return [
+            "File watcher disabled by SOCRATICODE_WATCHER=off.",
+            "Set SOCRATICODE_WATCHER=manual or auto and restart the MCP server before starting it.",
+          ].join("\n");
+        }
+
+        await ensureInfrastructure(projectPath);
 
         // Catch any changes made while the watcher was not running before starting it.
         const resolved = path.resolve(projectPath);
@@ -384,14 +573,36 @@ export async function handleIndexTool(
       const resolved = path.resolve(projectPath);
       // Check if the current project is watched by another process (cross-process lock)
       const watchedByOtherProcess = !watched.includes(resolved) && await isProjectLocked(resolved, "watch");
+
+      if (watcherMode === "off") {
+        const lines = ["File watcher: disabled (SOCRATICODE_WATCHER=off)"];
+        if (watched.includes(resolved)) {
+          lines.push(
+            "Warning: this process still has an active watcher. Restart the MCP server to apply the changed environment setting.",
+          );
+        } else if (watchedByOtherProcess) {
+          lines.push(
+            "Warning: another MCP process is still watching this project. Set SOCRATICODE_WATCHER=off for every process that uses this checkout.",
+          );
+        }
+        return lines.join("\n");
+      }
+
       if (watched.length === 0 && !watchedByOtherProcess) {
+        if (watcherMode === "manual") {
+          return [
+            "No projects are currently being watched.",
+            "Automatic watcher startup is disabled by SOCRATICODE_WATCHER=manual; use codebase_watch with action=start to start it explicitly.",
+          ].join("\n");
+        }
         return "No projects are currently being watched.";
       }
       const statusItems = watched.map((p) => `  - ${p}`);
       if (watchedByOtherProcess) {
         statusItems.push(`  - ${resolved} (watched by another process)`);
       }
-      return `Currently watching:\n${statusItems.join("\n")}`;
+      const modeLine = watcherMode === "manual" ? "\nWatcher mode: manual (started explicitly)" : "";
+      return `Currently watching:\n${statusItems.join("\n")}${modeLine}`;
     }
 
     default:

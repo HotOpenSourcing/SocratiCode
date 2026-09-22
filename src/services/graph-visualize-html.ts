@@ -29,9 +29,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getLanguageFromExtension } from "../constants.js";
 import type { CodeGraph } from "../types.js";
-import { findCircularDependencies } from "./graph-analysis.js";
+import { findCircularDependencies, nodeLanguage } from "./graph-analysis.js";
 import { logger } from "./logger.js";
 import { loadFilePayload, loadSymbolGraphMeta } from "./symbol-graph-store.js";
 
@@ -76,7 +75,7 @@ export interface VizSymbol {
 export interface VizSymbolEdge {
   source: string;  // symbol id
   target: string;  // symbol id (first candidate)
-  confidence: "unique" | "multiple-candidates" | "local" | "unresolved";
+  confidence: "unique" | "multiple-candidates" | "local" | "unresolved" | "engine";
 }
 
 export interface VizData {
@@ -213,7 +212,7 @@ function buildFileVizData(graph: CodeGraph): { files: VizFile[]; fileEdges: VizF
   const files: VizFile[] = graph.nodes.map((n) => ({
     id: n.relativePath,
     label: path.basename(n.relativePath),
-    language: getLanguageFromExtension(path.extname(n.relativePath).toLowerCase()),
+    language: nodeLanguage(n),
     deps: n.dependencies.length,
     dependents: n.dependents.length,
     symbolCount: 0,

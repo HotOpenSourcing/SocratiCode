@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { invalidateGraphCache, rebuildGraph } from "../../src/services/code-graph.js";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { graphCollectionName, projectIdFromPath } from "../../src/config.js";
+import { QDRANT_COLLECTION_PREFIX, SOCRATICODE_VERSION } from "../../src/constants.js";
+import { invalidateGraphCache, rebuildGraph, removeGraph } from "../../src/services/code-graph.js";
+import { getClient } from "../../src/services/qdrant.js";
 import { stopAllWatchers } from "../../src/services/watcher.js";
 import { handleContextTool } from "../../src/tools/context-tools.js";
 import { handleGraphTool } from "../../src/tools/graph-tools.js";
@@ -131,6 +135,125 @@ describe("graph tool handlers", () => {
       // Should contain dependency info
       expect(result).toBeDefined();
       expect(result.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe("codebase_graph_status import-resolution advisory (#107)", () => {
+    // The status output is where a consumer learns whether the graph can be
+    // trusted. READY is emitted on graph existence alone, so these pin that a
+    // graph which resolved almost nothing says so, and that a healthy one
+    // stays silent. The predicate's own boundaries are unit-tested; this is
+    // about the persisted count reaching the rendered output at all.
+
+    const buildPyProject = (name: string, body: (i: number) => string): FixtureProject => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), `socraticode-${name}-`));
+      fs.mkdirSync(path.join(root, "pkg"), { recursive: true });
+      fs.writeFileSync(path.join(root, "pkg", "__init__.py"), "", "utf-8");
+      for (let i = 0; i < 30; i++) {
+        fs.writeFileSync(path.join(root, "pkg", `mod_${i}.py`), body(i), "utf-8");
+      }
+      return {
+        root,
+        cleanup: () => {
+          try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }
+        },
+      };
+    };
+
+    it("reports the yield when almost no captured import resolved", async () => {
+      // 30 first-party-looking imports, none of which name a file in the
+      // tree — the shape a resolver failure produces.
+      const proj = buildPyProject(
+        "low-yield",
+        (i) => `from absent_dist_${i}.helpers import thing\n\ndef fn_${i}():\n    return thing\n`,
+      );
+      try {
+        await rebuildGraph(proj.root);
+
+        const result = await handleGraphTool("codebase_graph_status", {
+          projectPath: proj.root,
+        });
+
+        expect(result).toContain("Status: READY");
+        expect(result).toContain("Import resolution:");
+        expect(result).toContain("captured imports resolved to project files");
+        expect(result).toContain("will under-report dependencies");
+      } finally {
+        invalidateGraphCache(proj.root);
+        proj.cleanup();
+      }
+    });
+
+    it("stays silent on a graph whose imports resolved", async () => {
+      // Same size and import count, every import resolvable in-tree.
+      const proj = buildPyProject(
+        "healthy-yield",
+        (i) =>
+          `${i > 0 ? `from pkg.mod_${i - 1} import fn_${i - 1}\n` : ""}\ndef fn_${i}():\n    return ${i}\n`,
+      );
+      try {
+        await rebuildGraph(proj.root);
+
+        const result = await handleGraphTool("codebase_graph_status", {
+          projectPath: proj.root,
+        });
+
+        expect(result).toContain("Status: READY");
+        expect(result).not.toContain("Import resolution:");
+      } finally {
+        invalidateGraphCache(proj.root);
+        proj.cleanup();
+      }
+    });
+  });
+
+  describe("codebase_graph_status builder version (#120)", () => {
+    it("reports the version that built the graph now being served", async () => {
+      // A persisted graph outlives the binary that wrote it, and every other
+      // signal in this output describes the server: READY because a graph
+      // exists, and codebase_about's version because that is what is running.
+      // The three rendered forms are unit-tested; what this pins is that the
+      // stamp survives the round trip through storage and reaches the output.
+      const result = await handleGraphTool("codebase_graph_status", {
+        projectPath: fixture.root,
+      });
+
+      expect(result).toContain(`Built by: v${SOCRATICODE_VERSION}`);
+      expect(result).not.toContain("STALE");
+      expect(result).not.toContain("Built by: unknown");
+    });
+  });
+
+  describe("codebase_graph_status unresolved call share (#172)", () => {
+    it("states the share as captured symbol edges unmatched to a project symbol, builtins included", async () => {
+      // Every call here targets the runtime, so the unchanged metric is 100%;
+      // what this pins is that the definition reaches the output beside it.
+      // An ambient explicit id would write this graph over another project's.
+      vi.stubEnv("SOCRATICODE_PROJECT_ID", undefined);
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-unresolved-share-"));
+      fs.mkdirSync(path.join(root, "src"), { recursive: true });
+      fs.writeFileSync(
+        path.join(root, "src", "clock.ts"),
+        "export function tick(): string {\n  setTimeout(() => {}, 1);\n  return JSON.stringify({ at: Date.now() });\n}\n",
+        "utf-8",
+      );
+      try {
+        await rebuildGraph(root);
+
+        const result = await handleGraphTool("codebase_graph_status", {
+          projectPath: root,
+        });
+
+        expect(result).toContain("Status: READY");
+        expect(result).toContain("Unresolved: 100.0% of captured symbol edges did not match a project symbol");
+        expect(result).toContain("Symbol edges are calls, imports, re-exports and type or value references.");
+        expect(result).toContain("runtime builtins and external libraries");
+        expect(result).not.toMatch(/Unresolved: 100\.0%\n/);
+      } finally {
+        await removeGraph(root);
+        vi.unstubAllEnvs();
+        try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
     });
   });
 
@@ -273,15 +396,35 @@ describe.skipIf(!dockerAvailable)(
         expect(result).toContain("Missing required argument");
       });
 
-      it("returns a blast-radius report for a known symbol", async () => {
+      it("returns a blast-radius report for a known function symbol", async () => {
         const result = await handleGraphTool("codebase_impact", {
           projectPath: fixture.root,
-          target: "main",
+          target: "greet",
           depth: 3,
         });
         expect(typeof result).toBe("string");
-        // Either "Blast radius for ..." (found) or graceful empty/no-graph message.
-        expect(result.length).toBeGreaterThan(0);
+        expect(result).toContain("Blast radius for symbol: greet");
+        expect(result).toContain("src/index.ts");
+      });
+
+      it("returns a blast-radius report for an interface export (issue #132)", async () => {
+        const result = await handleGraphTool("codebase_impact", {
+          projectPath: fixture.root,
+          target: "UserConfig",
+          depth: 3,
+        });
+        expect(typeof result).toBe("string");
+        expect(result).toContain("Blast radius for symbol: UserConfig");
+        expect(result).toContain("src/index.ts");
+      });
+
+      it("returns informative not found error for non-existent symbol", async () => {
+        const result = await handleGraphTool("codebase_impact", {
+          projectPath: fixture.root,
+          target: "NonExistentSymbolXYZ",
+          depth: 3,
+        });
+        expect(result).toContain("not found");
       });
     });
 
@@ -413,6 +556,67 @@ describe.skipIf(!dockerAvailable)(
 
         expect(result).toBeDefined();
       }, 30_000);
+    });
+
+    describe("codebase_status builder version (#120)", () => {
+      // Mirrors the private constant in qdrant.ts. Reconstructed rather than
+      // exported, so the module keeps its surface; a rename fails this test
+      // loudly, since the doctored field would then still be present.
+      const metadataCollection = `${QDRANT_COLLECTION_PREFIX}socraticode_metadata`;
+
+      it("reports an unrecorded builder version and points at a rebuild", async () => {
+        // Reproduce a graph persisted before the stamp existed — the state
+        // that made a stale artifact indistinguishable from a resolver bug,
+        // and the one no rebuild on this machine can produce any more.
+        await rebuildGraph(fixture.root);
+        invalidateGraphCache(fixture.root);
+        const client = getClient();
+        // Keyed on the graph's own collection name, not on projectPath: the
+        // index metadata point lives in this same collection and carries the
+        // same projectPath, so a path filter would restore `builtByVersion`
+        // onto that point too, where it means nothing.
+        const filter = {
+          must: [
+            {
+              key: "collectionName",
+              match: { value: graphCollectionName(projectIdFromPath(path.resolve(fixture.root))) },
+            },
+          ],
+        };
+        await client.deletePayload(metadataCollection, {
+          keys: ["builtByVersion"],
+          filter,
+          wait: true,
+        });
+
+        try {
+          const result = await handleQueryTool("codebase_status", {
+            projectPath: fixture.root,
+          });
+
+          expect(result).toContain("Built by an unrecorded version");
+          expect(result).toContain("codebase_graph_build");
+          expect(result).not.toContain(`Built by v${SOCRATICODE_VERSION}`);
+        } finally {
+          // Leave the stored graph as it was found, so the tests after this
+          // one see a normally-stamped graph.
+          await client.setPayload(metadataCollection, {
+            payload: { builtByVersion: SOCRATICODE_VERSION },
+            filter,
+            wait: true,
+          });
+        }
+      }, 120_000);
+
+      it("says nothing about the builder when the graph is current", async () => {
+        const result = await handleQueryTool("codebase_status", {
+          projectPath: fixture.root,
+        });
+
+        expect(result).toContain("Code graph:");
+        expect(result).not.toContain("Built by an unrecorded version");
+        expect(result).not.toContain("run codebase_graph_build to pick up newer resolvers");
+      }, 60_000);
     });
 
     describe("codebase_update", () => {

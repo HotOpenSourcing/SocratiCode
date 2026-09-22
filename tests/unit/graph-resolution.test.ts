@@ -7,8 +7,17 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildCsNamespaceMap,
+  buildDartPackageMap,
+  buildGoModuleInfo,
   buildJvmSuffixMap,
+  buildPythonManifests,
+  buildRustCrateMap,
+  hasLiteralShellPathShape,
+  type PythonManifest,
+  pythonRootsForFile,
+  type RustCrate,
   resolveImport,
+  resolveRustImport,
 } from "../../src/services/graph-resolution.js";
 
 // ── Helper to create temp project layouts ─────────────────────────────
@@ -48,6 +57,18 @@ describe("graph-resolution", () => {
     project?.cleanup();
     project = null;
   });
+
+  // Python resolution as the graph builder calls it: manifests discovered from
+  // the tree, roots scoped to the importing file. Shared by every Python
+  // describe below so the probe order under test is the production one.
+  const pyResolve = (spec: string, from: string, p: TempProject) => {
+    const manifests = buildPythonManifests(p.root);
+    const roots = pythonRootsForFile(manifests, path.posix.dirname(from));
+    return resolveImport(
+      spec, path.join(p.root, from), p.root, p.fileSet, "python",
+      undefined, undefined, undefined, undefined, undefined, undefined, roots,
+    );
+  };
 
   describe("TypeScript/JavaScript resolution", () => {
     it("resolves relative imports with .js extension to .ts files", () => {
@@ -268,6 +289,1178 @@ describe("graph-resolution", () => {
 
       expect(result).toBe("src/mypackage/utils.py");
     });
+
+    it("resolves sibling-flat imports in service-style monorepos (#46)", () => {
+      // service-a/main.py runs as `python main.py` from inside service-a/,
+      // so `import config` resolves to service-a/config.py at runtime.
+      project = createTempProject({
+        "service-a/main.py": "",
+        "service-a/config.py": "",
+        "service-b/main.py": "",
+        "service-b/config.py": "",
+      });
+
+      const result = resolveImport(
+        "config",
+        path.join(project.root, "service-a/main.py"),
+        project.root,
+        project.fileSet,
+        "python",
+      );
+
+      expect(result).toBe("service-a/config.py");
+    });
+
+    it("resolves sibling-flat imports for dotted module paths", () => {
+      // `import shared.utils` from service-a/main.py with shared/utils.py
+      // sitting next to main.py.
+      project = createTempProject({
+        "service-a/main.py": "",
+        "service-a/shared/utils.py": "",
+      });
+
+      const result = resolveImport(
+        "shared.utils",
+        path.join(project.root, "service-a/main.py"),
+        project.root,
+        project.fileSet,
+        "python",
+      );
+
+      expect(result).toBe("service-a/shared/utils.py");
+    });
+
+    it("resolves sibling packages via __init__.py", () => {
+      // `import config` resolves to service-a/config/__init__.py when no
+      // bare service-a/config.py exists.
+      project = createTempProject({
+        "service-a/main.py": "",
+        "service-a/config/__init__.py": "",
+      });
+
+      const result = resolveImport(
+        "config",
+        path.join(project.root, "service-a/main.py"),
+        project.root,
+        project.fileSet,
+        "python",
+      );
+
+      expect(result).toBe("service-a/config/__init__.py");
+    });
+
+    it("preserves project-root precedence when the same name exists at root and as a sibling", () => {
+      // Backward-compat guarantee: `import config` from service-a/main.py
+      // still resolves to the project-root config.py if one exists, so
+      // existing layouts do not change after this PR. The sibling fallback
+      // only fires when the project-root lookup fails.
+      project = createTempProject({
+        "config.py": "",
+        "service-a/main.py": "",
+        "service-a/config.py": "",
+      });
+
+      const result = resolveImport(
+        "config",
+        path.join(project.root, "service-a/main.py"),
+        project.root,
+        project.fileSet,
+        "python",
+      );
+
+      expect(result).toBe("config.py");
+    });
+
+    it("returns null when neither project-root, src/, lib/, nor sibling have the module", () => {
+      project = createTempProject({
+        "service-a/main.py": "",
+      });
+
+      const result = resolveImport(
+        "config",
+        path.join(project.root, "service-a/main.py"),
+        project.root,
+        project.fileSet,
+        "python",
+      );
+
+      expect(result).toBeNull();
+    });
+  });
+
+  // ── Python manifest-declared import roots (#107) ──────────────────────
+
+  describe("Python src-layout resolution (#107)", () => {
+    // `uv init --lib`, hatchling and setuptools all generate
+    // `<package>/src/<module>/`, so in a workspace every cross-package import
+    // — and every package's own absolute self-import — named a path the
+    // project-root `src/`+`lib/` probe could not reach. A 362-file uv
+    // workspace built 3 edges. These tests pin the mechanism the fix rests
+    // on: the roots the pyproject.toml manifests declare, scoped to the
+    // importing file and tried nearest first.
+
+    // The reporter's layout: dashed distribution directory, intervening src/,
+    // underscored module name — a three-way mismatch no name-shaped guess
+    // can bridge. The root manifest declares the members, which is what puts
+    // one package's roots in scope for another's files.
+    const workspace = {
+      "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+      "packages/adapter-legislature/pyproject.toml": '[project]\nname = "adapter-legislature"\n',
+      "packages/adapter-legislature/src/adapter_legislature/tenure_spans.py": "",
+      "packages/adapter-sos/pyproject.toml": '[project]\nname = "adapter-sos"\n',
+      "packages/adapter-sos/src/adapter_sos/house/build.py": "",
+      "packages/adapter-sos/src/adapter_sos/db.py": "",
+    };
+
+    it("resolves a cross-package import through a nested src/ root", () => {
+      project = createTempProject(workspace);
+
+      const result = pyResolve(
+        "adapter_legislature.tenure_spans",
+        "packages/adapter-sos/src/adapter_sos/house/build.py",
+        project,
+      );
+
+      expect(result).toBe(
+        "packages/adapter-legislature/src/adapter_legislature/tenure_spans.py",
+      );
+    });
+
+    it("resolves a package's own absolute self-import", () => {
+      // Confirmed broken on main too: a package could not even import itself
+      // by its absolute module name, only relatively.
+      project = createTempProject(workspace);
+
+      const result = pyResolve(
+        "adapter_sos.db",
+        "packages/adapter-sos/src/adapter_sos/house/build.py",
+        project,
+      );
+
+      expect(result).toBe("packages/adapter-sos/src/adapter_sos/db.py");
+    });
+
+    it("resolves a single-module distribution with no package directory", () => {
+      // The load-bearing case for registering ROOTS rather than enumerating
+      // the module names under them: `src/solo_mod.py` is the whole importable
+      // surface and no directory bears the module's name, so a name
+      // enumeration would never see it.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/solo/pyproject.toml": '[project]\nname = "solo"\n',
+        "packages/solo/src/solo_mod.py": "",
+        "app/main.py": "",
+      });
+
+      expect(pyResolve("solo_mod", "app/main.py", project)).toBe(
+        "packages/solo/src/solo_mod.py",
+      );
+    });
+
+    it("resolves a PEP 420 namespace package with no __init__.py", () => {
+      // Registering roots asks nothing about what a directory contains, so
+      // implicit namespace packages resolve without a special case.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/ns-pkg/pyproject.toml": '[project]\nname = "ns-pkg"\n',
+        "packages/ns-pkg/src/acme/plugins/loader.py": "",
+        "app/main.py": "",
+      });
+
+      expect(pyResolve("acme.plugins.loader", "app/main.py", project)).toBe(
+        "packages/ns-pkg/src/acme/plugins/loader.py",
+      );
+    });
+
+    it("resolves a flat-layout package beside its own manifest", () => {
+      // Not every packaged project uses src/; the manifest directory itself
+      // is an import root in the flat layout.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/flatpkg/pyproject.toml": '[project]\nname = "flatpkg"\n',
+        "packages/flatpkg/flat_mod/thing.py": "",
+        "app/main.py": "",
+      });
+
+      expect(pyResolve("flat_mod.thing", "app/main.py", project)).toBe(
+        "packages/flatpkg/flat_mod/thing.py",
+      );
+    });
+
+    it("resolves a package import to __init__.py under a nested root", () => {
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/adapter-sos/pyproject.toml": '[project]\nname = "adapter-sos"\n',
+        "packages/adapter-sos/src/adapter_sos/__init__.py": "",
+        "app/main.py": "",
+      });
+
+      expect(pyResolve("adapter_sos", "app/main.py", project)).toBe(
+        "packages/adapter-sos/src/adapter_sos/__init__.py",
+      );
+    });
+
+    it("returns null for a module absent from every declared root", () => {
+      // Third-party imports must stay unresolved rather than be guessed into
+      // the project tree.
+      project = createTempProject(workspace);
+
+      expect(
+        pyResolve("requests.adapters", "packages/adapter-sos/src/adapter_sos/db.py", project),
+      ).toBeNull();
+    });
+
+    it("returns null for a src-layout import when no roots are passed", () => {
+      // Back-compat pin: every pre-#107 caller omits the list, and that
+      // omission must reproduce the old behavior exactly rather than
+      // half-resolving through some default.
+      project = createTempProject(workspace);
+
+      const result = resolveImport(
+        "adapter_legislature.tenure_spans",
+        path.join(project.root, "packages/adapter-sos/src/adapter_sos/house/build.py"),
+        project.root,
+        project.fileSet,
+        "python",
+      );
+
+      expect(result).toBeNull();
+    });
+
+    it("preserves project-root precedence over a manifest root", () => {
+      // Backward-compat guarantee, mirroring the #46 pin above: a layout that
+      // already resolved to the project-root file still resolves to it.
+      project = createTempProject({
+        "config.py": "",
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/pkg-a/pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "packages/pkg-a/src/config.py": "",
+        "packages/pkg-a/src/pkg_a/main.py": "",
+      });
+
+      expect(pyResolve("config", "packages/pkg-a/src/pkg_a/main.py", project)).toBe("config.py");
+    });
+
+    it("prefers the sibling-flat guess over a manifest root", () => {
+      // CPython puts the script's own directory at sys.path[0], ahead of every
+      // installed-distribution entry, so where a sibling file and a package
+      // root both offer the module, the sibling is what actually gets
+      // imported. Both match here; the sibling wins.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/pkg-a/pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "packages/pkg-a/src/shared/utils.py": "",
+        "packages/pkg-a/src/pkg_a/main.py": "",
+        "packages/pkg-a/src/pkg_a/shared/utils.py": "",
+      });
+
+      expect(pyResolve("shared.utils", "packages/pkg-a/src/pkg_a/main.py", project)).toBe(
+        "packages/pkg-a/src/pkg_a/shared/utils.py",
+      );
+    });
+
+    it("keeps each service's flat modules local in a per-service monorepo", () => {
+      // Two flat `uv init --app` services, each with its own config.py. A flat
+      // list of every root in the tree resolved beta's `import config` to
+      // alpha's file, because alpha sorted first — a confident edge into
+      // another service, with an unchanged edge count so no yield signal could
+      // surface it.
+      project = createTempProject({
+        "services/alpha-svc/pyproject.toml": '[project]\nname = "alpha-svc"\n',
+        "services/alpha-svc/main.py": "",
+        "services/alpha-svc/config.py": "",
+        "services/beta-svc/pyproject.toml": '[project]\nname = "beta-svc"\n',
+        "services/beta-svc/main.py": "",
+        "services/beta-svc/config.py": "",
+      });
+
+      expect(pyResolve("config", "services/beta-svc/main.py", project)).toBe(
+        "services/beta-svc/config.py",
+      );
+      expect(pyResolve("config", "services/alpha-svc/main.py", project)).toBe(
+        "services/alpha-svc/config.py",
+      );
+    });
+
+    it("prefers the importing package's own root over a sibling's for a non-sibling import", () => {
+      // Proximity ordering, in the case the #46 fallback cannot reach: the
+      // module sits under both packages' src/ roots but next to neither file,
+      // so only ordering by containment picks the importer's own package.
+      //
+      // The importer is the alphabetically LATER package on purpose. With
+      // pkg-a importing, lexicographic order would land on the right file by
+      // accident and the test could not tell proximity from luck — which is
+      // how a flat sorted list passed review while resolving beta-svc's
+      // `import config` to alpha-svc's file.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/pkg-a/pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "packages/pkg-a/src/shared/utils.py": "",
+        "packages/pkg-b/pyproject.toml": '[project]\nname = "pkg-b"\n',
+        "packages/pkg-b/src/shared/utils.py": "",
+        "packages/pkg-b/src/pkg_b/main.py": "",
+      });
+
+      expect(pyResolve("shared.utils", "packages/pkg-b/src/pkg_b/main.py", project)).toBe(
+        "packages/pkg-b/src/shared/utils.py",
+      );
+    });
+
+    it("does not resolve through a manifest in a non-importable subtree", () => {
+      // A sample app, cookiecutter template, docs project, checked-in sdist or
+      // per-fixture manifest sits on no sys.path the importing file could
+      // reach. Registering its roots globally turns an import that correctly
+      // resolved to nothing into a fabricated edge.
+      project = createTempProject({
+        "pyproject.toml": '[project]\nname = "mainpkg"\n',
+        "src/mainpkg/app.py": "",
+        "examples/demo/pyproject.toml": '[project]\nname = "demo"\n',
+        "examples/demo/settings.py": "",
+      });
+
+      expect(pyResolve("settings", "src/mainpkg/app.py", project)).toBeNull();
+    });
+
+    it("still resolves within a non-importable subtree's own files", () => {
+      // The example project is out of scope for the main package, not broken
+      // in itself: its own manifest is on its own files' ancestor path.
+      project = createTempProject({
+        "pyproject.toml": '[project]\nname = "mainpkg"\n',
+        "examples/demo/pyproject.toml": '[project]\nname = "demo"\n',
+        "examples/demo/src/demo_pkg/app.py": "",
+        "examples/demo/src/demo_pkg/settings.py": "",
+      });
+
+      expect(pyResolve("demo_pkg.settings", "examples/demo/src/demo_pkg/app.py", project)).toBe(
+        "examples/demo/src/demo_pkg/settings.py",
+      );
+    });
+
+    it("still resolves relative imports when roots are present", () => {
+      project = createTempProject({
+        "pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "src/pkg_a/main.py": "",
+        "src/pkg_a/models.py": "",
+      });
+
+      expect(pyResolve(".models", "src/pkg_a/main.py", project)).toBe("src/pkg_a/models.py");
+    });
+
+    it("keeps stdlib imports external even with roots present", () => {
+      // A project directory named after a stdlib module must not start
+      // drawing edges for `import os`.
+      project = createTempProject({
+        "pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "src/os.py": "",
+        "src/pkg_a/main.py": "",
+      });
+
+      expect(pyResolve("os", "src/pkg_a/main.py", project)).toBeNull();
+    });
+  });
+
+  describe("sibling-flat fallback scope (#157)", () => {
+    it("does not resolve a file to itself", () => {
+      // The first-party module named after the package it wraps. No Python
+      // import produces a dependency on the importing file.
+      project = createTempProject({
+        "src/pkg/__init__.py": "",
+        "src/pkg/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "src/pkg/requests.py", project)).toBeNull();
+    });
+
+    it("does not resolve `from . import x` in a package's own __init__.py to itself", () => {
+      // The bare `.` of `from . import mod` names the importing package, and
+      // the file that IS that package is this __init__.py — so the relative
+      // branch answers with the source file. It is the same fabricated
+      // self-edge the absolute probes now discard, and by far the commonest
+      // one in a Python tree; findCircularDependencies has no self-loop guard,
+      // so each one is reported as a cycle. Every other relative form still
+      // resolves.
+      project = createTempProject({
+        "src/pkg/__init__.py": "",
+        "src/pkg/mod.py": "",
+      });
+
+      expect(pyResolve(".", "src/pkg/__init__.py", project)).toBeNull();
+      expect(pyResolve(".", "src/pkg/mod.py", project)).toBe("src/pkg/__init__.py");
+      expect(pyResolve(".mod", "src/pkg/__init__.py", project)).toBe("src/pkg/mod.py");
+    });
+
+    it("does not resolve a file to itself in the #46 layout the fallback serves", () => {
+      // No __init__.py, so the sibling fallback still applies here and must:
+      // `import config` keeps resolving. Only the self match is discarded,
+      // which no package gate could reach — the two guards are independent.
+      project = createTempProject({
+        "service-a/main.py": "",
+        "service-a/config.py": "",
+        "service-a/requests.py": "",
+      });
+
+      expect(pyResolve("config", "service-a/main.py", project)).toBe("service-a/config.py");
+      expect(pyResolve("requests", "service-a/requests.py", project)).toBeNull();
+    });
+
+    it("leaves a non-self collision resolved — execution-mode ambiguity", () => {
+      // Which file CPython loads for `import requests` here depends on how
+      // mod.py is run, and the tree does not say: imported as `ns.sub.mod` the
+      // installed distribution wins, executed as `python src/ns/sub/mod.py`
+      // the sibling does. Pinned as a decision rather than an oversight — the
+      // resolver has no evidence of execution mode, so it does not guess.
+      // Only the unambiguous self-resolution is removed.
+      project = createTempProject({
+        "pyproject.toml": '[project]\nname = "ns-demo"\n',
+        "src/ns/sub/mod.py": "",
+        "src/ns/sub/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "src/ns/sub/mod.py", project)).toBe("src/ns/sub/requests.py");
+      expect(pyResolve("requests", "src/ns/sub/requests.py", project)).toBeNull();
+    });
+
+    it("keeps the #46 sibling edge when the service directory also has __init__.py", () => {
+      // `sys.path[0]` is the SCRIPT's directory whether or not that directory
+      // is also a package, so `python service-a/main.py` really does import
+      // service-a/config.py here. Gating the sibling probe on __init__.py
+      // would drop this legitimate #46 edge on a layout the tree cannot
+      // distinguish from a package module — a backward-compatibility
+      // regression, so it is not done.
+      project = createTempProject({
+        "service-a/__init__.py": "",
+        "service-a/main.py": "",
+        "service-a/config.py": "",
+      });
+
+      expect(pyResolve("config", "service-a/main.py", project)).toBe("service-a/config.py");
+    });
+
+    it("leaves a regular-package name collision resolved — execution-mode ambiguity", () => {
+      // The #157 report's own case, left alone on purpose. `import requests`
+      // from src/pkg/client.py loads the installed distribution when the file
+      // is reached as `pkg.client`, and the sibling when it is executed
+      // directly; __init__.py does not settle which, because sys.path[0]
+      // follows the invocation, not the layout. Documented rather than
+      // changed. Narrowing it needs evidence of execution mode the resolver
+      // does not have.
+      project = createTempProject({
+        "src/pkg/__init__.py": "",
+        "src/pkg/client.py": "",
+        "src/pkg/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "src/pkg/client.py", project)).toBe("src/pkg/requests.py");
+      // The self-edge in the same tree is still unambiguous, and still goes.
+      expect(pyResolve("requests", "src/pkg/requests.py", project)).toBeNull();
+    });
+
+    it("does not fall through a project-root self match into src/", () => {
+      // The root IS sys.path[0] for a file that sits there, so `import mod`
+      // from `mod.py` imports that same file — no later probe can name a
+      // module CPython would reach instead. Falling through answered with
+      // `src/mod.py`, an edge to an unrelated module: the self-edge traded for
+      // a wrong one rather than removed.
+      project = createTempProject({
+        "mod.py": "",
+        "src/mod.py": "",
+      });
+
+      expect(pyResolve("mod", "mod.py", project)).toBeNull();
+      // The src-layout file still reaches the root module; only the self
+      // match is discarded.
+      expect(pyResolve("mod", "src/mod.py", project)).toBe("mod.py");
+    });
+
+    it("does not fall through a src/ self match into lib/", () => {
+      // `src/` is this file's own path entry, so `import mod` from
+      // `src/mod.py` imports that same file; `lib/mod.py` is a different
+      // module CPython never reaches here. Falling through answered with it —
+      // the self-edge traded for a wrong one, exactly what the project-root
+      // probe above refuses to do.
+      project = createTempProject({
+        "src/mod.py": "",
+        "lib/mod.py": "",
+      });
+
+      expect(pyResolve("mod", "src/mod.py", project)).toBeNull();
+      // The lib file still reaches the src module — `src` is probed first, and
+      // only the self match is discarded.
+      expect(pyResolve("mod", "lib/mod.py", project)).toBe("src/mod.py");
+    });
+
+    it("does not fall through a manifest-root self match into a sibling package", () => {
+      // The roots are ordered containing-first, so the root that supplies the
+      // source file is the nearest path entry this file has and every root
+      // behind it belongs to another workspace member. Falling through
+      // answered `import requests` from pkg-a's own `requests.py` with pkg-b's
+      // — a fabricated cross-package edge, worse than the self-edge it
+      // replaced.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/pkg-a/pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "packages/pkg-b/pyproject.toml": '[project]\nname = "pkg-b"\n',
+        "packages/pkg-a/src/requests.py": "",
+        "packages/pkg-b/src/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "packages/pkg-a/src/requests.py", project)).toBeNull();
+      expect(pyResolve("requests", "packages/pkg-b/src/requests.py", project)).toBeNull();
+    });
+
+    it("keeps probing after discarding a sibling self match", () => {
+      // A self match discarded by the SIBLING probe must not end resolution —
+      // that probe is a guess at a directory Python may not have on sys.path
+      // at all. The legitimate answer here is reachable ONLY by the
+      // manifest-root probe, which runs after it: the project-root and src/
+      // probes both miss, so if the sibling self match ended the chain the
+      // real edge would be lost. `src` is
+      // an import root for pkg-a and `src/ns` is not, so CPython imports
+      // packages/pkg-a/src/requests.py for this file.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/pkg-a/pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "packages/pkg-a/src/requests.py": "",
+        "packages/pkg-a/src/ns/requests.py": "",
+      });
+
+      expect(pyResolve("requests", "packages/pkg-a/src/ns/requests.py", project)).toBe(
+        "packages/pkg-a/src/requests.py",
+      );
+    });
+  });
+
+  describe("buildPythonManifests", () => {
+    it("registers both the manifest directory and its src/ subdirectory", () => {
+      // The layout is not derivable from the import, so both candidates are
+      // registered; a root that does not exist holds no files and matches
+      // nothing.
+      project = createTempProject({
+        "packages/pkg-a/pyproject.toml": "",
+      });
+
+      const [manifest] = buildPythonManifests(project.root);
+
+      expect(manifest.dir).toBe("packages/pkg-a");
+      expect(manifest.roots).toEqual(["packages/pkg-a", "packages/pkg-a/src"]);
+    });
+
+    it("maps a root-level manifest to '.' and 'src'", () => {
+      project = createTempProject({ "pyproject.toml": "" });
+
+      const [manifest] = buildPythonManifests(project.root);
+
+      expect(manifest.dir).toBe(".");
+      expect(manifest.roots).toEqual([".", "src"]);
+    });
+
+    it("resolves workspace member globs against the manifests found", () => {
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/zeta/pyproject.toml": "",
+        "examples/demo/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha", "packages/zeta"]);
+    });
+
+    it("honours an exclude list alongside members", () => {
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["packages/legacy"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    // An entry this reader cannot represent means something different in the
+    // two arrays, which is why they share one void. Losing a MEMBER costs an
+    // edge that should have resolved. Losing an EXCLUSION admits a package the
+    // manifest explicitly excludes and draws a cross-package edge uv would
+    // not — the reader inventing a declaration rather than missing one. These
+    // pin the exclude side, whose only case used to be the plain literal.
+
+    it("voids the section when an exclude entry is truncated by a comment", () => {
+      // The regression: comment-stripping cut the array at the `#`, so the
+      // real exclusion behind it vanished and `legacy` became a member.
+      // Reading strings as opaque keeps both entries, and the exclusion holds.
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["packages/#legacy", "packages/legacy"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    // uv expands `members` by globbing the filesystem, where a lone `*` selects
+    // one path segment, but matches `exclude` against the member's whole path,
+    // where it does not stop at a separator. Translating both with the same
+    // narrow `*` under-excluded, and under-excluding is the direction that
+    // invents an edge. All three checked against uv 0.10.0 and 0.11.8, which
+    // agree.
+
+    it("excludes through a `*` that spans a path separator", () => {
+      // `*legacy` does not match `packages/legacy` a segment at a time, so a
+      // segment-wise `*` kept legacy a member and drew a cross-package edge to
+      // the one package the manifest named to keep out.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["*legacy"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("empties the workspace when a bare `*` is excluded", () => {
+      // Not an exotic spelling, and the whole point of the asymmetry: uv reads
+      // this as excluding every member, leaving the root alone.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["*"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("keeps a member whose path a `*` in the include list cannot span", () => {
+      // The include side must NOT gain the spanning `*`: uv globs the
+      // filesystem for members, so `packages/*` stops at a segment and
+      // `packages/alpha/inner` is not a member. Widening it here would
+      // register a root over a package the workspace never declared.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/alpha/inner/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("keeps a package a member when the only exclusion names a `#` path", () => {
+      // Looks like the case above and is not: uv reads `packages/#legacy` as a
+      // literal path that matches nothing, so `legacy` stays a member and the
+      // cross-package edge is correct. Voiding here would drop a real edge.
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["packages/#legacy"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha", "packages/legacy"]);
+    });
+
+    it("voids the section when an exclude entry uses a glob character class", () => {
+      // uv honours `[a]` as a class and excludes legacy. Matching it literally
+      // would exclude nothing and admit legacy, so the section is voided.
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["packages/leg[a]cy"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("voids the section when an exclude entry is not a quoted scalar", () => {
+      // A bare word is not a TOML value, so the document does not parse and the
+      // manifest declares nothing. Reading the members and ignoring the
+      // unreadable exclude would admit exactly the package it kept out.
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = [packages/legacy]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("voids the section when an exclude entry uses a `?` wildcard", () => {
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["packages/legac?"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    // uv reads each of the following as a workspace declaring `packages/*`,
+    // confirmed against uv 0.11.8 on identical manifests. Every one is ordinary
+    // TOML a user can write today; a reader matching the header as text found
+    // no members in any of them and said nothing about why — the same silent
+    // shape as issue #107 itself.
+
+    it("reads members from a spaced table header", () => {
+      project = createTempProject({
+        "pyproject.toml": '[ tool.uv.workspace ]\nmembers = ["packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("reads members from an inline workspace table under [tool.uv]", () => {
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv]\nworkspace = { members = ["packages/*"] }\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("reads members from a top-level dotted key", () => {
+      // Dotted keys belong to the table they sit under, so this one declares a
+      // workspace only because it precedes `[project]`. uv agrees.
+      project = createTempProject({
+        "pyproject.toml": 'tool.uv.workspace.members = ["packages/*"]\n[project]\nname = "root"\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("reads members past a comment containing a string delimiter", () => {
+      // A `"""` inside a comment opens nothing. Treating it as a delimiter
+      // blanked the rest of the file, and the real table below it vanished.
+      project = createTempProject({
+        "pyproject.toml": '# """\n[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("reads members from a manifest saved with a byte-order mark", () => {
+      // uv's parser skips a BOM and locks the workspace; TOML's grammar has no
+      // place for one, so `tomllib` and this parser both reject the document.
+      // Without stripping it the manifest would lose every member it declares.
+      project = createTempProject({
+        "pyproject.toml": '\uFEFF[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("reads a member spelled as a multi-line string", () => {
+      // A legal, if unusual, way to write the same glob. uv resolves it.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["""packages/*"""]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("reads members from a header carrying a trailing comment", () => {
+      // TOML's grammar allows a comment after a table header. Anchoring the
+      // header to end-of-line rejected the commented form, and because a
+      // manifest with no readable members simply scopes to its own subtree,
+      // the failure was silent: every cross-package import went back to null.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]  # the workspace root\nmembers = ["packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("does not read a quoted word inside a comment as a member", () => {
+      // A comment sitting in the array would otherwise contribute its quoted
+      // text as a member glob.
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = [\n  "packages/*",  # not "examples/demo"\n]\n',
+        "packages/alpha/pyproject.toml": "",
+        "examples/demo/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("voids the section when a member uses a glob character class", () => {
+      // uv matches with a full globset, so `packages/[ab]*` selects a set this
+      // reader cannot compute. Reading the rest of the array and ignoring this
+      // entry would be a guess about what the manifest declares; voiding falls
+      // back to ancestor-path scoping, which resolves strictly fewer imports.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/[ab]*", "packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("voids the section when a member uses a `?` wildcard", () => {
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/alph?"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("voids the section when the array is missing a separator", () => {
+      // uv refuses to parse this manifest, so it declares nothing. Scanning for
+      // quoted runs read two members out of a document that has none.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/alpha" "packages/zeta"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/zeta/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("voids the section when members is not an array", () => {
+      // uv fails the lock outright on this manifest. A single string is not a
+      // member list, and guessing that it means a one-element one would be the
+      // reader deciding what the manifest meant.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = "packages/*"\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("voids the section when a member entry is not a string", () => {
+      // Keeping the well-formed neighbours would be a guess about a manifest uv
+      // rejects, and every entry kept is a root registered over other packages.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*", 3]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("voids the section when exclude is not an array", () => {
+      // The exclude side needs its own guard: treating an unreadable exclusion
+      // as no exclusion admits the one package the manifest names.
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = "packages/legacy"\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("keeps building the graph when a manifest cannot be parsed", () => {
+      // A manifest that fails to parse declares nothing; it must not throw out
+      // of the walk, or one malformed file anywhere in the tree would cost the
+      // whole project its Python roots. Same contract as an unreadable file.
+      project = createTempProject({
+        "pyproject.toml": "[tool.uv.workspace\nmembers = [",
+        "packages/alpha/pyproject.toml": '[tool.uv.workspace]\nmembers = ["inner"]\n',
+        "packages/alpha/inner/pyproject.toml": "",
+      });
+
+      const manifests = buildPythonManifests(project.root);
+
+      expect(manifests.map((m) => m.dir)).toEqual([
+        "packages/alpha/inner",
+        "packages/alpha",
+        ".",
+      ]);
+      expect(manifests.find((m) => m.dir === ".")?.members).toEqual([]);
+      expect(manifests.find((m) => m.dir === "packages/alpha")?.members).toEqual([
+        "packages/alpha/inner",
+      ]);
+    });
+
+    it("reads a `#` inside a member string as a literal path character", () => {
+      // Not a defect and must not be treated as one: uv reads this as a path
+      // that happens to contain `#`, matches nothing, and the manifest declares
+      // no members. A `#` in a string does not open a comment.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/#alpha"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("reads a member string carrying the other quote character", () => {
+      // An extraction that stopped at whichever quote came first yielded the
+      // member `it` — a directory the manifest never names. Inside a basic
+      // string an apostrophe is just a character.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["it\'s/*"]\n',
+        "it/pyproject.toml": "",
+        "it's/inner/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["it's/inner"]);
+    });
+
+    it("ignores a prose header that a real table header appears to close", () => {
+      // The `[tool.other]` line is prose inside the same block, not a table, so
+      // a reader that ends the section there never meets the closing delimiter
+      // and cannot tell this from a declaration. The whole block is one string
+      // value, and the document declares no workspace at all.
+      project = createTempProject({
+        "pyproject.toml":
+          'description = """\n[tool.uv.workspace]\nmembers = ["packages/*"]\n[tool.other]\n"""\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("reads a members list beside a multi-line string in the same table", () => {
+      // A multi-line string in the workspace table must not cost the table its
+      // real declaration. The prose carries its own `members` line ahead of the
+      // real one, so reading the section as text finds the wrong array first.
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nnotes = """\nmembers = ["packages/legacy"]\n"""\nmembers = ["packages/alpha"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("ignores a workspace header written inside a multi-line string", () => {
+      // `tomllib` and uv both report no such table for prose in a description
+      // block. Matching the header as text cannot tell the two apart and would
+      // invent members for a manifest that declares none.
+      project = createTempProject({
+        "pyproject.toml":
+          'description = """\n[tool.uv.workspace]\nmembers = ["packages/*"]\n"""\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("reads members only from the tool.uv.workspace table", () => {
+      // A `members` key under some other tool's table is a different key, not
+      // uv's — `[tool.other]` is where this one lives.
+      project = createTempProject({
+        "pyproject.toml": '[tool.other]\nmembers = ["packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("declares no members for a [tool.uv] table with no workspace", () => {
+      // The ordinary single-package uv manifest: `[tool.uv]` present, no
+      // workspace under it. The lookup walks two keys successfully and finds
+      // nothing at the third, so the value it ends on has to be checked before
+      // it is read as a table — otherwise the commonest uv manifest of all
+      // takes the whole graph build down with it.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv]\ndev-dependencies = ["pytest"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("skips manifests under site-packages", () => {
+      // Every installed distribution ships a pyproject.toml, and each would
+      // register an import root over vendored code that shadows the project's
+      // own modules. The virtualenv here is named so that
+      // DEFAULT_IGNORE_PATTERNS (.venv/venv/env) does not cover it.
+      project = createTempProject({
+        "pyproject.toml": "",
+        ".venv312/lib/python3.12/site-packages/requests/pyproject.toml": "",
+      });
+
+      expect(buildPythonManifests(project.root).map((m) => m.dir)).toEqual(["."]);
+    });
+
+    it("skips manifests under dist-packages", () => {
+      // Debian and Ubuntu's system Python installs distributions into
+      // dist-packages rather than site-packages; both shadow project modules
+      // the same way.
+      project = createTempProject({
+        "pyproject.toml": "",
+        "vendored/lib/python3.12/dist-packages/requests/pyproject.toml": "",
+      });
+
+      expect(buildPythonManifests(project.root).map((m) => m.dir)).toEqual(["."]);
+    });
+
+    it("skips manifests under ignored directories", () => {
+      project = createTempProject({
+        "pyproject.toml": "",
+        "node_modules/some-pkg/pyproject.toml": "",
+      });
+
+      expect(buildPythonManifests(project.root).map((m) => m.dir)).toEqual(["."]);
+    });
+
+    it("returns an empty list for a project with no manifest", () => {
+      // Keeps the resolver's pre-#107 behavior for unpackaged script repos:
+      // no manifests means no roots and no extra resolution step at all.
+      project = createTempProject({ "app/main.py": "" });
+
+      expect(buildPythonManifests(project.root)).toEqual([]);
+    });
+  });
+
+  describe("pythonRootsForFile", () => {
+    const manifests = (entries: Array<[string, string[]]>): PythonManifest[] =>
+      entries.map(([dir, members]) => ({
+        dir,
+        roots: [dir, dir === "." ? "src" : `${dir}/src`],
+        members,
+      }));
+
+    it("orders containing roots first, deepest first", () => {
+      // A package's own root must outrank the project root, or a name present
+      // in both resolves to the wrong one.
+      const roots = pythonRootsForFile(
+        manifests([[".", ["packages/pkg-a"]], ["packages/pkg-a", []]]),
+        "packages/pkg-a/src/pkg_a",
+      );
+
+      expect(roots.slice(0, 2)).toEqual(["packages/pkg-a/src", "packages/pkg-a"]);
+    });
+
+    it("puts a containing root ahead of one that sorts earlier alphabetically", () => {
+      // Containment must beat lexicographic order outright, not merely agree
+      // with it. pkg-z's own roots come first even though pkg-a sorts before
+      // them, which is the whole of the fix for the cross-service mixup.
+      const roots = pythonRootsForFile(
+        manifests([
+          [".", ["packages/pkg-a", "packages/pkg-z"]],
+          ["packages/pkg-a", []],
+          ["packages/pkg-z", []],
+        ]),
+        "packages/pkg-z/src/pkg_z",
+      );
+
+      expect(roots.slice(0, 2)).toEqual(["packages/pkg-z/src", "packages/pkg-z"]);
+      expect(roots.indexOf("packages/pkg-z")).toBeLessThan(roots.indexOf("packages/pkg-a"));
+    });
+
+    it("excludes a manifest that is neither an ancestor nor a declared member", () => {
+      // Only the root manifest's roots survive, and `src` precedes `.`
+      // because the file sits inside it — deepest containing root first.
+      const roots = pythonRootsForFile(
+        manifests([[".", []], ["examples/demo", []]]),
+        "src/mainpkg",
+      );
+
+      expect(roots).toEqual(["src", "."]);
+    });
+
+    it("includes a sibling package declared as a workspace member", () => {
+      const roots = pythonRootsForFile(
+        manifests([
+          [".", ["packages/pkg-a", "packages/pkg-b"]],
+          ["packages/pkg-a", []],
+          ["packages/pkg-b", []],
+        ]),
+        "packages/pkg-a/src/pkg_a",
+      );
+
+      expect(roots).toContain("packages/pkg-b/src");
+    });
+
+    it("orders non-containing roots lexicographically for cross-machine determinism", () => {
+      // Nothing about a cross-package import says which package was meant, so
+      // the tie must break the same way everywhere rather than by walk order.
+      const roots = pythonRootsForFile(
+        manifests([
+          [".", ["packages/pkg-b", "packages/pkg-c"]],
+          ["packages/pkg-b", []],
+          ["packages/pkg-c", []],
+        ]),
+        "app",
+      );
+
+      expect(roots.filter((r) => r.startsWith("packages/"))).toEqual([
+        "packages/pkg-b",
+        "packages/pkg-b/src",
+        "packages/pkg-c",
+        "packages/pkg-c/src",
+      ]);
+    });
+
+    it("returns nothing when no manifest applies", () => {
+      expect(pythonRootsForFile(manifests([["examples/demo", []]]), "src/app")).toEqual([]);
+    });
   });
 
   describe("Rust resolution", () => {
@@ -319,6 +1512,1173 @@ describe("graph-resolution", () => {
       );
 
       expect(result).toBeNull();
+    });
+
+    // ── Crate map ──────────────────────────────────────────────────────
+
+    /** Lay out a project and read its crates the way buildCodeGraph does. */
+    let fileSet = new Set<string>();
+    const rustProject = (files: Record<string, string>): RustCrate[] => {
+      project = createTempProject(files);
+      fileSet = project.fileSet;
+      return buildRustCrateMap(fileSet, project.root);
+    };
+
+    it("records a crate under the name Cargo lets others import it by", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "my-app-core"\nedition = "2021"\n',
+        "src/lib.rs": "",
+      });
+
+      expect(crates).toEqual([
+        {
+          dir: ".",
+          name: "my_app_core",
+          packageName: "my_app_core",
+          libRoot: "src/lib.rs",
+          roots: ["src/lib.rs"],
+          edition: "2021",
+        },
+      ]);
+    });
+
+    it("keeps the package name beside a library name that differs from it", () => {
+      // A dependency on this crate is declared under the package name; the
+      // code that uses it writes the library name. Both are needed to tell
+      // whether an import names a crate the importing package declared.
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "rust-crypto"\n\n[lib]\nname = "crypto"\n',
+        "src/lib.rs": "",
+      });
+
+      expect(crates[0].name).toBe("crypto");
+      expect(crates[0].packageName).toBe("rust_crypto");
+      expect(crates[0].manifestUnread).toBeUndefined();
+    });
+
+    it("inherits the edition a workspace declares for its members", () => {
+      // `edition.workspace = true` is a table, not a string, so reading the
+      // key as a plain string dropped the member to 2015 — and 2015 turns
+      // autodiscovery off next to a declared `[[bin]]`, so `due.rs` stopped
+      // being a crate root at all. Cargo 1.70, 1.85 and 1.98 all keep it.
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["app"]\n\n[workspace.package]\nedition = "2021"\n',
+        "app/Cargo.toml":
+          '[package]\nname = "app"\nedition.workspace = true\n\n[[bin]]\nname = "uno"\npath = "src/bin/uno.rs"\n',
+        "app/src/lib.rs": "",
+        "app/src/bin/uno.rs": "",
+        "app/src/bin/due.rs": "",
+      });
+
+      const member = crates.find((crate) => crate.dir === "app");
+      expect(member?.edition).toBe("2021");
+      expect(member?.roots).toContain("app/src/bin/due.rs");
+    });
+
+    it("keeps a member that asks for no edition on the 2015 rules", () => {
+      // The other hand of the test above: inheritance happens only when the
+      // member spells it out. With the key absent, Cargo reads 2015 — and
+      // then the declared `[[bin]]` does turn autodiscovery off, which is
+      // what makes the assertion above mean something.
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["app"]\n\n[workspace.package]\nedition = "2021"\n',
+        "app/Cargo.toml":
+          '[package]\nname = "app"\n\n[[bin]]\nname = "uno"\npath = "src/bin/uno.rs"\n',
+        "app/src/lib.rs": "",
+        "app/src/bin/uno.rs": "",
+        "app/src/bin/due.rs": "",
+      });
+
+      const member = crates.find((crate) => crate.dir === "app");
+      expect(member?.edition).toBe("2015");
+      expect(member?.roots).not.toContain("app/src/bin/due.rs");
+    });
+
+    it("keeps a member's own edition over the one the workspace declares", () => {
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["app"]\n\n[workspace.package]\nedition = "2021"\n',
+        "app/Cargo.toml": '[package]\nname = "app"\nedition = "2015"\n',
+        "app/src/lib.rs": "",
+      });
+
+      expect(crates.find((crate) => crate.dir === "app")?.edition).toBe("2015");
+    });
+
+    it("takes the library path a manifest declares over the conventional one", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "odd"\n\n[lib]\npath = "lib/entry.rs"\n',
+        "lib/entry.rs": "",
+        "src/lib.rs": "",
+      });
+
+      expect(crates[0].libRoot).toBe("lib/entry.rs");
+    });
+
+    it("takes the library name over the package name", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "the-package"\n\n[lib]\nname = "the_lib"\n',
+        "src/lib.rs": "",
+      });
+
+      expect(crates[0].name).toBe("the_lib");
+    });
+
+    it("gives no importable name to a crate with no library", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "just-a-binary"\n',
+        "src/main.rs": "",
+      });
+
+      expect(crates[0]).toMatchObject({ name: null, libRoot: null, roots: ["src/main.rs"] });
+    });
+
+    it("records every target as a root of its own module tree", () => {
+      const crates = rustProject({
+        "Cargo.toml":
+          '[package]\nname = "many"\nedition = "2021"\n\n[[bin]]\nname = "declared"\npath = "extra/tool.rs"\n',
+        "src/lib.rs": "",
+        "src/main.rs": "",
+        "src/bin/one.rs": "",
+        "src/bin/two/main.rs": "",
+        "src/bin/two/helper.rs": "",
+        "extra/tool.rs": "",
+        "tests/it.rs": "",
+        "examples/demo.rs": "",
+        "benches/bench.rs": "",
+        "build.rs": "",
+      });
+
+      expect(crates[0].roots).toEqual([
+        "benches/bench.rs",
+        "build.rs",
+        "examples/demo.rs",
+        "extra/tool.rs",
+        "src/bin/one.rs",
+        "src/bin/two/main.rs",
+        "src/lib.rs",
+        "src/main.rs",
+        "tests/it.rs",
+      ]);
+    });
+
+    it("stops discovering binaries when a 2015 manifest declares one by hand", () => {
+      // Same tree as above with the edition key removed, which is what a 2015
+      // manifest looks like. `cargo metadata` on it reports six targets, not
+      // nine: declaring a `[[bin]]` by hand turns off the autodiscovery of the
+      // rest in that edition, and `src/main.rs` is one of the rest.
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "many"\n\n[[bin]]\nname = "declared"\npath = "extra/tool.rs"\n',
+        "src/lib.rs": "",
+        "src/main.rs": "",
+        "src/bin/one.rs": "",
+        "src/bin/two/main.rs": "",
+        "extra/tool.rs": "",
+        "tests/it.rs": "",
+        "examples/demo.rs": "",
+        "benches/bench.rs": "",
+        "build.rs": "",
+      });
+
+      expect(crates[0].edition).toBe("2015");
+      expect(crates[0].roots).toEqual([
+        "benches/bench.rs",
+        "build.rs",
+        "examples/demo.rs",
+        "extra/tool.rs",
+        "src/lib.rs",
+        "tests/it.rs",
+      ]);
+    });
+
+    it("keeps a malformed manifest's conventional targets and gives it no name", () => {
+      const crates = rustProject({
+        "Cargo.toml": "[package\nname = ",
+        "src/lib.rs": "",
+      });
+
+      expect(crates[0]).toMatchObject({ name: null, roots: ["src/lib.rs"] });
+    });
+
+    it("ignores the manifests Cargo unpacks under target/", () => {
+      const crates = rustProject({
+        // DEFAULT_IGNORE_PATTERNS lists `target`, so only a negation reaches
+        // the unconditional skip — and a negation is all it takes for every
+        // vendored dependency to register as a crate of this project.
+        ".socraticodeignore": "!target/\n",
+        "Cargo.toml": '[package]\nname = "real"\n',
+        "src/lib.rs": "",
+        "target/package/vendored-0.1.0/Cargo.toml": '[package]\nname = "vendored"\n',
+        "target/package/vendored-0.1.0/src/lib.rs": "",
+      });
+
+      expect(crates.map((c) => c.name)).toEqual(["real"]);
+    });
+
+    // ── Module paths ───────────────────────────────────────────────────
+
+    it("resolves crate:: against the crate root", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/db/pool.rs": "",
+        "src/db/mod.rs": "",
+      });
+
+      expect(resolveRustImport("crate::db::pool", "src/lib.rs", fileSet, crates))
+        .toBe("src/db/pool.rs");
+    });
+
+    it("stops at the deepest path segment that names a file", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/db.rs": "",
+      });
+
+      // `Connection` is a type inside db.rs, not a module below it.
+      expect(resolveRustImport("crate::db::Connection", "src/lib.rs", fileSet, crates))
+        .toBe("src/db.rs");
+    });
+
+    it("resolves a path naming only root items to the root module", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/other.rs": "",
+      });
+
+      expect(resolveRustImport("crate::Error", "src/other.rs", fileSet, crates))
+        .toBe("src/lib.rs");
+    });
+
+    it("resolves super:: to the parent module's sibling", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/api/routes.rs": "",
+        "src/api/state.rs": "",
+      });
+
+      expect(resolveRustImport("super::state::State", "src/api/routes.rs", fileSet, crates))
+        .toBe("src/api/state.rs");
+    });
+
+    it("climbs one module per super", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/a/b/c.rs": "",
+        "src/a/shared.rs": "",
+      });
+
+      expect(resolveRustImport("super::super::shared", "src/a/b/c.rs", fileSet, crates))
+        .toBe("src/a/shared.rs");
+    });
+
+    it("does not let super:: climb out of the crate", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app"]\n',
+        "crates/app/Cargo.toml": '[package]\nname = "app"\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/thing.rs": "",
+        // Beside the crate's src/, so an unchecked second climb lands on it.
+        "crates/app/outside.rs": "",
+      });
+
+      // `thing` sits directly under the crate root, so `super` is already the
+      // root and a second climb would leave the module tree entirely.
+      expect(resolveRustImport("super::super::outside", "crates/app/src/thing.rs", fileSet, crates))
+        .toBeNull();
+    });
+
+    it("does not draw an edge from a module file to itself", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/a/mod.rs": "",
+      });
+
+      // `use super::a::Thing;` inside `mod tests` in a/mod.rs walks back down
+      // to the file it started from.
+      expect(resolveRustImport("super::a::Thing", "src/a/mod.rs", fileSet, crates))
+        .toBeNull();
+    });
+
+    it("resolves self:: to a submodule of the importing file", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/parser.rs": "",
+        "src/parser/lexer.rs": "",
+      });
+
+      expect(resolveRustImport("self::lexer::Token", "src/parser.rs", fileSet, crates))
+        .toBe("src/parser/lexer.rs");
+    });
+
+    it("resolves a sibling crate by the name Cargo gives it", () => {
+      const crates = rustProject({
+        "Cargo.toml": "[workspace]\nmembers = [\"crates/cli\", \"crates/core\"]\n",
+        // Declared, as rustc requires: a sibling the manifest never names is
+        // not in the extern prelude, whatever the workspace holds.
+        "crates/cli/Cargo.toml": '[package]\nname = "app-cli"\n\n[dependencies]\napp-core = { path = "../core" }\n',
+        "crates/cli/src/main.rs": "",
+        "crates/core/Cargo.toml": '[package]\nname = "app-core"\n',
+        "crates/core/src/lib.rs": "",
+        "crates/core/src/config.rs": "",
+      });
+
+      expect(resolveRustImport("app_core::config::Config", "crates/cli/src/main.rs", fileSet, crates))
+        .toBe("crates/core/src/config.rs");
+    });
+
+    it("does not reach a sibling crate the importing package never declared", () => {
+      // Review finding. Only what a package declares is in its extern prelude:
+      // `use helper::Thing` in a package whose manifest names no `helper` is
+      // E0432 to rustc, yet the raw name used to be searched across every crate
+      // of the workspace and drew an edge into the sibling. Declared under
+      // another name, the alias is what the code writes; the package's own
+      // library is the one name reached without declaring it.
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["app", "helper", "util"]\n',
+        "app/Cargo.toml": '[package]\nname = "app"\n\n[dependencies]\nutil = { path = "../util" }\ntools = { path = "../helper", package = "helper" }\n',
+        "app/src/lib.rs": "",
+        "app/src/bin/tool.rs": "",
+        "helper/Cargo.toml": '[package]\nname = "helper"\n',
+        "helper/src/lib.rs": "",
+        "util/Cargo.toml": '[package]\nname = "util"\n',
+        "util/src/lib.rs": "",
+        // `util` declares nothing, so `helper` is out of its reach too.
+      });
+
+      expect(resolveRustImport("helper::Thing", "app/src/lib.rs", fileSet, crates)).toBeNull();
+      expect(resolveRustImport("helper::Thing", "util/src/lib.rs", fileSet, crates)).toBeNull();
+      expect(resolveRustImport("tools::Thing", "app/src/lib.rs", fileSet, crates)).toBe("helper/src/lib.rs");
+      expect(resolveRustImport("util::Thing", "app/src/lib.rs", fileSet, crates)).toBe("util/src/lib.rs");
+      expect(resolveRustImport("app::run", "app/src/bin/tool.rs", fileSet, crates)).toBe("app/src/lib.rs");
+    });
+
+    it("admits a declared dependency by the library name its code is imported under", () => {
+      // Review finding on the fence's first cut. A dependency is declared
+      // under its package name, and the code writes its library name: `other`
+      // in the manifest, `otherlib` in the `use`, wherever `[lib] name` is
+      // set — `rust-crypto` is imported as `crypto`. Keyed on the declared
+      // names alone, the fence turned that edge away, a regression against the
+      // head before it. Renamed, the alias is the only name in scope: with
+      // `dep = { package = "other" }` the code writes `dep`, and `otherlib`
+      // is E0432.
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["app", "renamer", "other"]\n',
+        "app/Cargo.toml": '[package]\nname = "app"\n\n[dependencies]\nother = { path = "../other" }\n',
+        "app/src/lib.rs": "",
+        "renamer/Cargo.toml": '[package]\nname = "renamer"\n\n[dependencies]\ndep = { path = "../other", package = "other" }\n',
+        "renamer/src/lib.rs": "",
+        "other/Cargo.toml": '[package]\nname = "other"\n\n[lib]\nname = "otherlib"\n',
+        "other/src/lib.rs": "",
+        "other/src/deep.rs": "",
+      });
+
+      expect(resolveRustImport("otherlib::deep::Thing", "app/src/lib.rs", fileSet, crates)).toBe("other/src/deep.rs");
+      expect(resolveRustImport("other::Thing", "app/src/lib.rs", fileSet, crates)).toBeNull();
+      expect(resolveRustImport("dep::deep::Thing", "renamer/src/lib.rs", fileSet, crates)).toBe("other/src/deep.rs");
+      expect(resolveRustImport("otherlib::Thing", "renamer/src/lib.rs", fileSet, crates)).toBeNull();
+    });
+
+    it("does not fence a package whose manifest could not be read", () => {
+      // Review finding. An unparseable `Cargo.toml` declares nothing that can
+      // be known, and reading that as "declares nothing" cost the package every
+      // cross-crate edge — where the map's own promise is that one unreadable
+      // manifest must not cost the project its Rust edges.
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["app", "util"]\n',
+        "app/Cargo.toml": '[package]\nname = "app"\n\n[[[broken\n',
+        "app/src/lib.rs": "",
+        "util/Cargo.toml": '[package]\nname = "util"\n',
+        "util/src/lib.rs": "",
+      });
+
+      expect(crates.find((c) => c.dir === "app")?.manifestUnread).toBe(true);
+      expect(resolveRustImport("util::Thing", "app/src/lib.rs", fileSet, crates)).toBe("util/src/lib.rs");
+    });
+
+    it("leaves a third-party crate unresolved", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/models.rs": "",
+      });
+
+      expect(resolveRustImport("serde::Deserialize", "src/lib.rs", fileSet, crates))
+        .toBeNull();
+    });
+
+    it("resolves a uniform path to a module in scope", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/store.rs": "",
+      });
+
+      // `mod store;` beside `pub use store::Store;` — the 2018 spelling that
+      // omits `self::`, which is how a crate republishes its own modules.
+      expect(resolveRustImport("store::Store", "src/lib.rs", fileSet, crates))
+        .toBe("src/store.rs");
+    });
+
+    it("resolves super:: to the parent module's own file", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/store.rs": "",
+        "src/store/open.rs": "",
+      });
+
+      // The parent of `store::open` is `store`, which lives in store.rs beside
+      // the directory — the layout rustc recommends over store/mod.rs.
+      expect(resolveRustImport("super::Store", "src/store/open.rs", fileSet, crates))
+        .toBe("src/store.rs");
+    });
+
+
+    it("resolves a mod declaration into the declaring file's own directory", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/parser.rs": "",
+        "src/parser/lexer.rs": "",
+        "src/lexer.rs": "",
+      });
+
+      // `mod lexer;` inside src/parser.rs is src/parser/lexer.rs — the file
+      // beside parser.rs is a different module with the same name.
+      expect(resolveRustImport("lexer", "src/parser.rs", fileSet, crates))
+        .toBe("src/parser/lexer.rs");
+    });
+
+    it("resolves a mod declaration in a crate root beside it", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/config.rs": "",
+      });
+
+      expect(resolveRustImport("config", "src/lib.rs", fileSet, crates))
+        .toBe("src/config.rs");
+    });
+
+    it("treats a binary under src/bin as its own crate root", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/helper.rs": "",
+        "src/bin/tool.rs": "",
+        "src/bin/helper.rs": "",
+      });
+
+      // The binary's module tree starts in src/bin, so its `crate::helper` is
+      // src/bin/helper.rs and not the library's src/helper.rs.
+      expect(resolveRustImport("crate::helper", "src/bin/tool.rs", fileSet, crates))
+        .toBe("src/bin/helper.rs");
+    });
+
+    it("does not let a root's directory capture a file whose name merely begins with it", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/helper.rs": "",
+        "src/bin/tool.rs": "",
+        "src/bindings.rs": "",
+      });
+
+      // `src/bindings.rs` belongs to the library. Its path begins with the
+      // string "src/bin", but not with the directory "src/bin/" — comparing
+      // the prefix without the separator hands the file the binary's root,
+      // and `crate::helper` then looks for `src/bin/helper.rs`, which is not
+      // the file the library declares. The guard is one character wide, so
+      // nothing else in the suite fails when it is removed.
+      expect(resolveRustImport("crate::helper", "src/bindings.rs", fileSet, crates))
+        .toBe("src/helper.rs");
+    });
+
+    it("prefers the crate whose directory holds the importing file", () => {
+      const crates = rustProject({
+        "workspace-a/Cargo.toml": '[package]\nname = "shared"\n',
+        "workspace-a/src/lib.rs": "",
+        "workspace-a/src/thing.rs": "",
+        "workspace-b/Cargo.toml": '[package]\nname = "shared"\n',
+        "workspace-b/src/lib.rs": "",
+        "workspace-b/src/thing.rs": "",
+        "workspace-b/src/user.rs": "",
+      });
+
+      expect(resolveRustImport("shared::thing", "workspace-b/src/user.rs", fileSet, crates))
+        .toBe("workspace-b/src/thing.rs");
+    });
+
+    it("resolves mod, self and super with no manifest in the tree", () => {
+      project = createTempProject({
+        "src/lib.rs": "",
+        "src/api.rs": "",
+        "src/api/routes.rs": "",
+        "src/api/state.rs": "",
+      });
+
+      expect(resolveRustImport("routes", "src/api.rs", project.fileSet, []))
+        .toBe("src/api/routes.rs");
+      expect(resolveRustImport("super::state", "src/api/routes.rs", project.fileSet, []))
+        .toBe("src/api/state.rs");
+      expect(resolveRustImport("crate::api::state", "src/api/routes.rs", project.fileSet, []))
+        .toBeNull();
+    });
+
+    it("resolves through resolveImport with the crate map passed in", () => {
+      project = createTempProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/config.rs": "",
+      });
+      const crates = buildRustCrateMap(project.fileSet, project.root);
+
+      const result = resolveImport(
+        "crate::config::Config",
+        path.join(project.root, "src/lib.rs"),
+        project.root,
+        project.fileSet,
+        "rust",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        crates,
+      );
+
+      expect(result).toBe("src/config.rs");
+    });
+
+    it("disables target autodiscovery when autobins, autotests, autoexamples, or autobenches is false", () => {
+      const crates = rustProject({
+        "Cargo.toml":
+          '[package]\nname = "spenta"\nautobins = false\nautotests = false\nautoexamples = false\nautobenches = false\n',
+        "src/lib.rs": "",
+        "src/bin/tool.rs": "",
+        "tests/integration.rs": "",
+        "examples/demo.rs": "",
+        "benches/bench.rs": "",
+      });
+
+      expect(crates[0].roots).toEqual(["src/lib.rs"]);
+    });
+
+    it("disables library autodiscovery when autolib is false", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "no-lib"\nautolib = false\n',
+        "src/lib.rs": "",
+        "src/main.rs": "",
+      });
+
+      expect(crates[0]).toMatchObject({
+        name: null,
+        libRoot: null,
+        roots: ["src/main.rs"],
+      });
+    });
+
+    it("does not register build.rs when package build is false", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "no-build"\nbuild = false\n',
+        "src/lib.rs": "",
+        "build.rs": "",
+      });
+
+      expect(crates[0].roots).toEqual(["src/lib.rs"]);
+    });
+
+    it("finds a target declared by name alone at the path Cargo gives that name", () => {
+      // `[[bin]] name = "tool"` with no `path` is resolved by convention from
+      // the name: src/bin/tool.rs, tests/cli.rs, examples/demo.rs,
+      // benches/speed.rs. Edition 2015 is what makes this test able to fail —
+      // there the declarations turn autodiscovery off, so the name is the only
+      // route left to those files. `cargo metadata` reports exactly these five
+      // targets for this manifest on 1.70.0, 1.85.0 and 1.98.0.
+      const crates = rustProject({
+        "Cargo.toml": [
+          '[package]',
+          'name = "app"',
+          'edition = "2015"',
+          '',
+          '[[bin]]',
+          'name = "tool"',
+          '',
+          '[[test]]',
+          'name = "cli"',
+          '',
+          '[[example]]',
+          'name = "demo"',
+          '',
+          '[[bench]]',
+          'name = "speed"',
+          '',
+        ].join("\n"),
+        "src/lib.rs": "",
+        "src/bin/tool.rs": "",
+        "tests/cli.rs": "",
+        "examples/demo.rs": "",
+        "benches/speed.rs": "",
+      });
+
+      expect(crates[0].roots).toEqual([
+        "benches/speed.rs",
+        "examples/demo.rs",
+        "src/bin/tool.rs",
+        "src/lib.rs",
+        "tests/cli.rs",
+      ]);
+    });
+
+    it("shuts off autodiscovery for declared target types in edition 2015 but keeps it in 2018+", () => {
+      const crates2015 = rustProject({
+        "Cargo.toml":
+          '[package]\nname = "e2015"\nedition = "2015"\n\n[[bin]]\nname = "explicit"\npath = "custom/tool.rs"\n',
+        "src/lib.rs": "",
+        "custom/tool.rs": "",
+        "src/bin/other.rs": "",
+      });
+      // In 2015, manual [[bin]] turns off autobins by default
+      expect(crates2015[0].roots).toEqual(["custom/tool.rs", "src/lib.rs"]);
+
+      const crates2018 = rustProject({
+        "Cargo.toml":
+          '[package]\nname = "e2018"\nedition = "2018"\n\n[[bin]]\nname = "explicit"\npath = "custom/tool.rs"\n',
+        "src/lib.rs": "",
+        "custom/tool.rs": "",
+        "src/bin/other.rs": "",
+      });
+      // In 2018+, manual [[bin]] leaves autodiscovery on
+      expect(crates2018[0].roots).toEqual(["custom/tool.rs", "src/bin/other.rs", "src/lib.rs"]);
+    });
+
+    it("keeps a member under [workspace] exclude importable by name", () => {
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["crates/*"]\nexclude = ["crates/ignored", "crates/fixtures/*"]\n',
+        "crates/app/Cargo.toml":
+          '[package]\nname = "app"\n\n[dependencies]\nignored-crate = { path = "../ignored" }\n',
+        "crates/app/src/lib.rs": "",
+        "crates/ignored/Cargo.toml": '[package]\nname = "ignored-crate"\n',
+        "crates/ignored/src/lib.rs": "",
+        "crates/fixtures/demo/Cargo.toml": '[package]\nname = "demo-fixture"\n',
+        "crates/fixtures/demo/src/lib.rs": "",
+        "standalone/Cargo.toml": '[package]\nname = "standalone"\n',
+        "standalone/src/lib.rs": "",
+      });
+
+      // `exclude` keeps a member out of the default set of workspace-wide
+      // commands; it says nothing about who may depend on it. A member can
+      // and does depend on an excluded package by path — built and compiled
+      // to check — so reading `exclude` as "not importable" loses that edge.
+      expect(crates.find((c) => c.dir === "crates/app")?.name).toBe("app");
+      expect(crates.find((c) => c.dir === "crates/ignored")?.name).toBe("ignored_crate");
+      expect(crates.find((c) => c.dir === "crates/fixtures/demo")?.name).toBe("demo_fixture");
+      expect(crates.find((c) => c.dir === "standalone")?.name).toBe("standalone");
+    });
+
+    it("records renamed dependency aliases in crate aliases map", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/*"]\n',
+        "crates/core/Cargo.toml": '[package]\nname = "app-core"\n',
+        "crates/core/src/lib.rs": "",
+        "crates/app/Cargo.toml":
+          '[package]\nname = "app"\n\n[dependencies]\nmy_alias = { package = "app-core", path = "../core" }\n',
+        "crates/app/src/lib.rs": "",
+      });
+
+      const appCrate = crates.find((c) => c.dir === "crates/app");
+      expect(appCrate?.aliases).toEqual({
+        my_alias: "app_core",
+      });
+    });
+
+    it("resolves workspace dependency aliases defined in [workspace.dependencies]", () => {
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["crates/*"]\n\n[workspace.dependencies]\nshared-alias = { package = "actual-core", path = "crates/core" }\n',
+        "crates/core/Cargo.toml": '[package]\nname = "actual-core"\n',
+        "crates/core/src/lib.rs": "",
+        "crates/app/Cargo.toml":
+          '[package]\nname = "app"\n\n[dependencies]\nshared-alias = { workspace = true }\n',
+        "crates/app/src/lib.rs": "",
+      });
+
+      const appCrate = crates.find((c) => c.dir === "crates/app");
+      expect(appCrate?.aliases).toEqual({
+        shared_alias: "actual_core",
+      });
+    });
+
+    it("skips custom build directories marked with CACHEDIR.TAG or .cargo-ok", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "my-app"\n',
+        "src/lib.rs": "",
+        "custom-target/CACHEDIR.TAG": "Signature: 8a477f597d28d172783f06886806bc55\n",
+        "custom-target/vendored/Cargo.toml": '[package]\nname = "vendored"\n',
+        "custom-target/vendored/src/lib.rs": "",
+      });
+
+      expect(crates.map((c) => c.name)).toEqual(["my_app"]);
+    });
+
+    it("correctly resolves the benchmark workspace with disabled autodiscovery and excluded member", () => {
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["membri/*"]\nexclude = ["membri/fuori"]\n',
+        "membri/app/Cargo.toml": '[package]\nname = "app"\n',
+        "membri/app/src/lib.rs": "",
+        "membri/spenta/Cargo.toml":
+          '[package]\nname = "spenta"\nautobins = false\nautotests = false\nautoexamples = false\n',
+        "membri/spenta/src/lib.rs": "",
+        "membri/spenta/src/bin/ignorato.rs": "",
+        "membri/spenta/tests/ignorato.rs": "",
+        "membri/spenta/examples/ignorato.rs": "",
+        "membri/fuori/Cargo.toml": '[package]\nname = "fuori-dal-giro"\n',
+        "membri/fuori/src/lib.rs": "",
+      });
+
+      const appCrate = crates.find((c) => c.dir === "membri/app");
+      const spentaCrate = crates.find((c) => c.dir === "membri/spenta");
+      const fuoriCrate = crates.find((c) => c.dir === "membri/fuori");
+
+      expect(appCrate?.name).toBe("app");
+      expect(appCrate?.roots).toEqual(["membri/app/src/lib.rs"]);
+
+      expect(spentaCrate?.name).toBe("spenta");
+      expect(spentaCrate?.roots).toEqual(["membri/spenta/src/lib.rs"]);
+
+      expect(fuoriCrate?.name).toBe("fuori_dal_giro");
+      expect(fuoriCrate?.roots).toEqual(["membri/fuori/src/lib.rs"]);
+    });
+
+    // ── Paths the conventions do not reach ─────────────────────────────
+
+    it("takes the file of a mod from the path its attribute declares", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        "src/area.rs": "",
+        "src/elsewhere/moved.rs": "",
+      });
+
+      // The attribute is relative to the directory the declaring file sits in,
+      // never to the directory that file's own submodules live in.
+      expect(resolveRustImport("elsewhere/moved.rs", "src/area.rs", fileSet, crates))
+        .toBe("src/elsewhere/moved.rs");
+      expect(resolveRustImport("elsewhere/moved.rs", "src/lib.rs", fileSet, crates))
+        .toBe("src/elsewhere/moved.rs");
+      expect(resolveRustImport("nowhere/absent.rs", "src/lib.rs", fileSet, crates)).toBeNull();
+    });
+
+    it("counts a path attribute inside an inline module from the module directory", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        "src/area.rs": "",
+        "src/block/moved.rs": "",
+        "src/area/block/moved.rs": "",
+      });
+
+      // From the crate root the module directory is `src`; from `src/area.rs`
+      // it is `src/area`. Both then take one directory per inline level.
+      expect(resolveRustImport("self/block/moved.rs", "src/lib.rs", fileSet, crates))
+        .toBe("src/block/moved.rs");
+      expect(resolveRustImport("self/block/moved.rs", "src/area.rs", fileSet, crates))
+        .toBe("src/area/block/moved.rs");
+    });
+
+    it("leaves an unanchored 2015 path unresolved, a declared limit", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/registry.rs": "",
+        "src/client.rs": "",
+      });
+
+      // `use registry::write;` in `src/client.rs` does compile in 2015 when
+      // `mod registry;` is written in `lib.rs`, and names `src/registry.rs`.
+      // The edge is left undrawn on purpose: acting on the root-relative
+      // reading means answering a path with no declaration behind it, and every
+      // attempt to bound that drew an edge rustc rejects — a bare `use b;`
+      // between two integration-test crates, an undeclared sibling file, a
+      // `mod` declared in a nested block, a virtual workspace's root crate
+      // claiming its members' declarations. `main` drew nothing here either.
+      expect(resolveRustImport("registry::write", "src/client.rs", fileSet, crates)).toBeNull();
+    });
+
+    it("reads an unanchored path from the file's own module directory, never the crate root", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        // The crate root's `registry`, which is what the 2015 reading would
+        // reach and this one must not.
+        "src/registry.rs": "",
+        "src/client.rs": "",
+        "src/client/registry.rs": "",
+      });
+
+      // `src/client.rs` owns `src/client/`, so the head is read from there and
+      // the crate root's `registry` is not it. The rule holds in every
+      // edition — the 2015 case above is the same walk with nothing to find.
+      // Review finding: this asserted `null` on a fixture without
+      // `src/client/registry.rs`, which is also what the 2015 case answers, so
+      // it passed on the absence of a file and proved nothing. Its name said
+      // "from edition 2018 on", a distinction the resolver stopped making when
+      // the declaration gate was turned on for every edition.
+      expect(resolveRustImport("registry::write", "src/client.rs", fileSet, crates)).toBe(
+        "src/client/registry.rs",
+      );
+    });
+
+    it("lets a local module win over a sibling crate of the same name", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
+        // Declared, as rustc requires for the sibling to be in scope at all.
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nconfig = { path = "../config" }\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/config.rs": "",
+        "crates/config/Cargo.toml": '[package]\nname = "config"\nedition = "2021"\n',
+        "crates/config/src/lib.rs": "",
+      });
+
+      // rustc consults the extern prelude last, so a module in scope wins. The
+      // other order drew an edge into an unrelated crate whenever a local
+      // module carried a published crate's name.
+      expect(resolveRustImport("config::Settings", "crates/app/src/lib.rs", fileSet, crates))
+        .toBe("crates/app/src/config.rs");
+    });
+
+    it("keeps a leading :: out of the local modules", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
+        // Declared, as rustc requires for the sibling to be in scope at all.
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nconfig = { path = "../config" }\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/config.rs": "",
+        "crates/config/Cargo.toml": '[package]\nname = "config"\nedition = "2021"\n',
+        "crates/config/src/lib.rs": "",
+      });
+
+      // Without the marker this is the same path as `config::Settings`, which
+      // the local module answers — and the leading `::` is written precisely
+      // to say it should not.
+      expect(resolveRustImport("::config::Settings", "crates/app/src/lib.rs", fileSet, crates))
+        .toBe("crates/config/src/lib.rs");
+    });
+
+    it("reads a leading :: as the crate root in edition 2015", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2015"\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/config.rs": "",
+        "crates/config/Cargo.toml": '[package]\nname = "config"\nedition = "2021"\n',
+        "crates/config/src/lib.rs": "",
+      });
+
+      // The same specifier, one edition earlier, means the opposite thing:
+      // there is no extern prelude to point at, and `::` is the crate root an
+      // unanchored path already counts from. Checked on 1.98.0, where a crate
+      // with `pub mod log;` and `use ::log::LocalMarker;` compiles under 2015
+      // and is E0432 under 2018.
+      expect(resolveRustImport("::config::Settings", "crates/app/src/lib.rs", fileSet, crates))
+        .toBe("crates/app/src/config.rs");
+    });
+
+    it("answers a 2015 leading :: from the crate root, not from the child's own declarations", () => {
+      // Review finding, left open from an earlier round. `src/deep/child.rs`
+      // declares `#[path = "local.rs"] mod foo;` of its own, and the root
+      // declares `mod foo;` too. `use ::foo::Item` written in the child names
+      // the root's — `::` is the crate root in 2015 — yet the child's
+      // declaration map was consulted first and answered with `local.rs`.
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2015"\n',
+        "src/lib.rs": "",
+        "src/foo.rs": "",
+        "src/deep/mod.rs": "",
+        "src/deep/child.rs": "",
+        "src/deep/local.rs": "",
+      });
+      const childDeclares = new Map([["foo", "local.rs"]]);
+
+      expect(resolveRustImport("::foo::Item", "src/deep/child.rs", fileSet, crates, childDeclares))
+        .toBe("src/foo.rs");
+      expect(resolveRustImport("::foo", "src/deep/child.rs", fileSet, crates, childDeclares))
+        .toBe("src/foo.rs");
+      // Without the marker the child's own `foo` is the one in scope.
+      expect(resolveRustImport("foo::Item", "src/deep/child.rs", fileSet, crates, childDeclares))
+        .toBe("src/deep/local.rs");
+    });
+
+    it("answers a 2015 leading :: with a declared crate when the root has no such module", () => {
+      // Review finding on the branch's first cut: the walk from the root fell
+      // back on the root file whenever nothing matched, so the crate lookup
+      // after it never ran — a declared sibling lost its edge to the
+      // importer's own `lib.rs`, and a registry crate gained one. In 2015
+      // `extern crate foo;` at the root puts the crate at the root; the
+      // sibling resolves, the registry crate resolves to nothing, and a name
+      // rustc provides on its own — `core` — is not an item of this crate.
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["old", "foo"]\n',
+        "old/Cargo.toml": '[package]\nname = "old"\nedition = "2015"\n\n[dependencies]\nfoo = { path = "../foo" }\ncfg-if = "1"\n',
+        "old/src/lib.rs": "",
+        "old/src/bar.rs": "",
+        "old/src/deep/mod.rs": "",
+        "old/src/deep/child.rs": "",
+        "old/tests/it.rs": "",
+        "foo/Cargo.toml": '[package]\nname = "foo"\n',
+        "foo/src/lib.rs": "",
+        "foo/src/item.rs": "",
+      });
+
+      expect(resolveRustImport("::foo::item::Item", "old/src/deep/child.rs", fileSet, crates)).toBe("foo/src/item.rs");
+      expect(resolveRustImport("::foo", "old/src/deep/child.rs", fileSet, crates)).toBe("foo/src/lib.rs");
+      expect(resolveRustImport("::cfg_if::cfg_if", "old/src/deep/child.rs", fileSet, crates)).toBeNull();
+      expect(resolveRustImport("::core::fmt", "old/src/deep/child.rs", fileSet, crates)).toBeNull();
+      // A module of the root still wins, and an item of the root is the root.
+      expect(resolveRustImport("::bar::BarItem", "old/src/deep/child.rs", fileSet, crates)).toBe("old/src/bar.rs");
+      expect(resolveRustImport("::RootItem", "old/src/deep/child.rs", fileSet, crates)).toBe("old/src/lib.rs");
+      // An integration test reaches the library by its crate name.
+      expect(resolveRustImport("::old::bar::BarItem", "old/tests/it.rs", fileSet, crates)).toBe("old/src/bar.rs");
+    });
+
+    it("leaves a 2015 leading :: unresolved when no target root covers the file", () => {
+      // A file outside every Cargo target has no root to count from, and a
+      // guess would be an edge rustc never draws. `foo` is declared, so the
+      // fence is not what answers here: it is the missing root.
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["app", "foo"]\n',
+        "app/Cargo.toml": '[package]\nname = "app"\nedition = "2015"\n\n[dependencies]\nfoo = { path = "../foo" }\n',
+        "app/src/lib.rs": "",
+        "app/scratch/loose.rs": "",
+        "foo/Cargo.toml": '[package]\nname = "foo"\n',
+        "foo/src/lib.rs": "",
+      });
+
+      expect(resolveRustImport("::foo::Item", "app/scratch/loose.rs", fileSet, crates)).toBeNull();
+    });
+
+    it("lets an unanchored path reach a module the file declares, and only then", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nserde = "1"\n',
+        "src/lib.rs": "",
+        "src/serde.rs": "",
+      });
+
+      // Both hands in one place, which is what the graph-level assertion
+      // cannot do: there the `mod serde;` declaration draws the same edge, so
+      // the edge stays whatever the unanchored path resolves to.
+      expect(
+        resolveRustImport("serde::Local", "src/lib.rs", fileSet, crates, new Map([["serde", "serde"]])),
+      ).toBe("src/serde.rs");
+      expect(
+        resolveRustImport("serde::Local", "src/lib.rs", fileSet, crates, new Map()),
+      ).toBeNull();
+    });
+
+    it("reaches a module the attribute moved, and its children beside that file", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/foo"]\n',
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/custom.rs": "",
+        "crates/app/src/inner.rs": "",
+        // A library carrying the module's name, which is what the path used to
+        // land on once the name alone found no file.
+        "crates/foo/Cargo.toml": '[package]\nname = "foo"\nedition = "2021"\n',
+        "crates/foo/src/lib.rs": "",
+      });
+
+      // `#[path = "custom.rs"] mod foo;` — the name is `foo`, the file is
+      // `custom.rs`, and the declaration carries both.
+      const declared = new Map([["foo", "custom.rs"]]);
+
+      expect(
+        resolveRustImport("foo::Item", "crates/app/src/lib.rs", fileSet, crates, declared),
+      ).toBe("crates/app/src/custom.rs");
+
+      // The children sit beside that file, not under a directory named after
+      // it: rustc says `src/inner.rs` with E0583, on 1.70.0 and 1.98.0.
+      expect(
+        resolveRustImport("foo::inner::Thing", "crates/app/src/lib.rs", fileSet, crates, declared),
+      ).toBe("crates/app/src/inner.rs");
+
+      // The hand that makes this fail if the declared file is dropped: with
+      // the name alone the path found nothing and fell through to the
+      // same-named library.
+      expect(
+        resolveRustImport(
+          "foo::Item",
+          "crates/app/src/lib.rs",
+          fileSet,
+          crates,
+          new Map([["foo", "foo"]]),
+        ),
+      ).toBeNull();
+    });
+
+    it("reaches a module an attribute inside an inline block moved", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        "src/tests/moved.rs": "",
+      });
+
+      // Written inside `mod tests { #[path = "moved.rs"] mod fixtures; }`, the
+      // attribute counts from the file's own module directory and one level
+      // deeper per inline block — which extractImports marks with a `self/`
+      // head, since nothing in the path itself tells the two forms apart.
+      expect(
+        resolveRustImport(
+          "fixtures::build",
+          "src/lib.rs",
+          fileSet,
+          crates,
+          new Map([["fixtures", "self/tests/moved.rs"]]),
+        ),
+      ).toBe("src/tests/moved.rs");
+    });
+
+    it("does not read a file whose name begins with self as the inline form", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        "src/self_check.rs": "",
+      });
+
+      // `#[path = "self_check.rs"] mod checks;` is the ordinary form: the
+      // marker for the inline one is the `self/` head, separator included.
+      // Matching on `self` alone cut five characters off this path and looked
+      // for `heck.rs`.
+      expect(
+        resolveRustImport(
+          "checks::run",
+          "src/lib.rs",
+          fileSet,
+          crates,
+          new Map([["checks", "self_check.rs"]]),
+        ),
+      ).toBe("src/self_check.rs");
+    });
+
+    it("keeps a leading :: out of the local modules for a bare head too", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
+        // Declared, as rustc requires for the sibling to be in scope at all.
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nconfig = { path = "../config" }\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/config.rs": "",
+        "crates/config/Cargo.toml": '[package]\nname = "config"\nedition = "2021"\n',
+        "crates/config/src/lib.rs": "",
+      });
+
+      // `use ::config;` beside `mod config;`: the marker says the head names a
+      // crate, and it says it in the one shape where the local module would
+      // otherwise win outright — a head with nothing below it.
+      expect(
+        resolveRustImport(
+          "::config",
+          "crates/app/src/lib.rs",
+          fileSet,
+          crates,
+          new Map([["config", "config"]]),
+        ),
+      ).toBe("crates/config/src/lib.rs");
+    });
+
+    it("holds the declaration gate on in edition 2015 too", () => {
+      const crates = rustProject({
+        // No edition key: Cargo reads 2015, and there the path below is
+        // absolute from the crate root.
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/registry.rs": "",
+        "src/client.rs": "",
+      });
+
+      // The gate is a 2018 rule that this resolver applies to every edition,
+      // and the reason is the tail behind the alternative: answering a
+      // root-relative path means resolving one no declaration proves, and each
+      // bound put on that turned out to draw an edge rustc rejects. Both
+      // spellings stay unresolved — the multi-segment path and the bare head
+      // that arrives in the shape a declaration does.
+      expect(
+        resolveRustImport("registry::write", "src/client.rs", fileSet, crates, new Map()),
+      ).toBeNull();
+      // `false` says this is a `use` and not a `mod` declaration: the two
+      // arrive as the same string.
+      expect(
+        resolveRustImport("registry", "src/client.rs", fileSet, crates, new Map(), false),
+      ).toBeNull();
+      // And the declaration in the same position still counts from the file.
+      expect(
+        resolveRustImport("registry", "src/deep.rs", fileSet, crates, new Map(), true),
+      ).toBeNull();
+    });
+
+    it("leaves a single-segment path on the crate when no declaration names it", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/bar"]\n',
+        "crates/app/Cargo.toml":
+          '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nbar = { path = "../bar" }\n',
+        "crates/app/src/lib.rs": "",
+        // An orphan left by a refactor: on disk, in no module tree.
+        "crates/app/src/bar.rs": "",
+        "crates/bar/Cargo.toml": '[package]\nname = "bar"\nedition = "2021"\n',
+        "crates/bar/src/lib.rs": "",
+      });
+
+      // `use bar;` and `mod bar;` arrive in the same shape, and only the
+      // declaration may reach the file. cargo 1.70.0 and 1.98.0 compile
+      // `use bar;` against the dependency with that orphan sitting there.
+      expect(
+        resolveRustImport("bar", "crates/app/src/lib.rs", fileSet, crates, new Map()),
+      ).toBe("crates/bar/src/lib.rs");
+      expect(
+        resolveRustImport("bar", "crates/app/src/lib.rs", fileSet, crates, new Map([["bar", "bar"]])),
+      ).toBe("crates/app/src/bar.rs");
+    });
+
+    it("follows a dependency renamed in the manifest to the crate it points at", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/core"]\n',
+        "crates/app/Cargo.toml":
+          '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nnucleus = { package = "app-core", path = "../core" }\n',
+        "crates/app/src/lib.rs": "",
+        "crates/core/Cargo.toml": '[package]\nname = "app-core"\nedition = "2021"\n',
+        "crates/core/src/lib.rs": "",
+        "crates/core/src/state.rs": "",
+      });
+
+      // The code writes the alias, which appears in no `[package] name`.
+      expect(resolveRustImport("nucleus::state::State", "crates/app/src/lib.rs", fileSet, crates))
+        .toBe("crates/core/src/state.rs");
+    });
+
+    it("never resolves a path to the file that wrote it", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        "src/db.rs": "",
+      });
+
+      // `use crate::db::Connection;` inside `#[cfg(test)] mod tests` in db.rs
+      // names that same file; as an edge it is a node depending on itself.
+      expect(resolveRustImport("crate::db::Connection", "src/db.rs", fileSet, crates)).toBeNull();
     });
   });
 
@@ -566,7 +2926,10 @@ describe("graph-resolution", () => {
       expect(result).toBe("lib/utils/helpers.dart");
     });
 
-    it("returns null for package: imports", () => {
+    it("returns null for package: imports when no package map is passed", () => {
+      // Back-compat pin: every pre-#106 caller omits the map, and that
+      // omission must reproduce the old behavior exactly — package: imports
+      // stay unresolved rather than half-resolving through some default.
       project = createTempProject({
         "lib/main.dart": "",
       });
@@ -596,6 +2959,282 @@ describe("graph-resolution", () => {
       );
 
       expect(result).toBeNull();
+    });
+  });
+
+  // ── Dart package: resolution (#106) ────────────────────────────────────
+
+  describe("Dart package: resolution (#106)", () => {
+    // Flutter's own templates import intra-project files as
+    // `package:<name>/...`, so before #106 a Flutter project's file graph
+    // lost nearly every edge: both the external classifier and the dart
+    // case rejected the scheme outright. These tests pin the mechanism the
+    // fix rests on — the pubspec-derived name map plus pub's universal
+    // `package:<name>/<rest>` → `<package_root>/lib/<rest>` mapping.
+
+    const dartResolve = (
+      spec: string,
+      from: string,
+      p: TempProject,
+      map: Map<string, string> | undefined,
+    ) =>
+      resolveImport(
+        spec,
+        path.join(p.root, from),
+        p.root,
+        p.fileSet,
+        "dart",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        map,
+      );
+
+    it("resolves an own-package import through lib/", () => {
+      // The lib/ segment is the load-bearing detail: pub maps the package
+      // URI root to lib/, so resolving <rest> against the package root
+      // alone (the shape issue #106 originally proposed) matches nothing.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\nenvironment:\n  sdk: ^3.0.0\n",
+        "lib/main.dart": "",
+        "lib/src/service.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      const result = dartResolve("package:my_app/src/service.dart", "lib/main.dart", project, map);
+
+      expect(result).toBe("lib/src/service.dart");
+    });
+
+    it("returns null for an external package absent from the map", () => {
+      // package:flutter and every pub.dev dependency have no in-repo
+      // pubspec, so they are not in the map — the edge must be dropped,
+      // not guessed into the project tree.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "lib/main.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      const result = dartResolve("package:flutter/material.dart", "lib/main.dart", project, map);
+
+      expect(result).toBeNull();
+    });
+
+    it("resolves cross-package imports in a monorepo of nested packages", () => {
+      // Pub workspaces and melos monorepos import sibling packages with the
+      // same package: form as external ones; only the nested-pubspec scan
+      // tells the two apart. This is the edge class that makes
+      // codebase_impact see cross-package callers.
+      project = createTempProject({
+        "packages/feature_a/pubspec.yaml": "name: feature_a\n",
+        "packages/feature_a/lib/a.dart": "",
+        "packages/feature_b/pubspec.yaml": "name: feature_b\n",
+        "packages/feature_b/lib/src/b.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      const result = dartResolve(
+        "package:feature_b/src/b.dart",
+        "packages/feature_a/lib/a.dart",
+        project,
+        map,
+      );
+
+      expect(result).toBe("packages/feature_b/lib/src/b.dart");
+    });
+
+    it("rejects dot segments instead of letting them escape lib/", () => {
+      // path.posix.join normalizes `..`, so without the guard
+      // `package:my_app/../secret.dart` would resolve to a real file OUTSIDE
+      // lib/ and draw an edge the source never expresses.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "lib/main.dart": "",
+        "secret.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      expect(dartResolve("package:my_app/../secret.dart", "lib/main.dart", project, map)).toBeNull();
+      expect(dartResolve("package:my_app/./main.dart", "lib/main.dart", project, map)).toBeNull();
+    });
+
+    it("rejects backslashes instead of resolving them as path or name", () => {
+      // win32 path.resolve treats a backslash as a separator, so without
+      // the explicit guard `..\\secret.dart` traverses out of lib/ there.
+      // On POSIX that effect is unobservable: toForwardSlash inside
+      // resolveRelativePath textually rewrites the backslash and the lookup
+      // misses regardless, so this test pins the CONTRACT (backslash URIs
+      // never resolve, decoy file present or not) rather than the guard
+      // alone — it fails only if both defenses are removed, and the guard
+      // is what defends the win32 path this suite cannot execute.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "lib/main.dart": "",
+        "lib/..\\secret.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      expect(dartResolve("package:my_app/..\\secret.dart", "lib/main.dart", project, map)).toBeNull();
+    });
+
+    it("returns null for a bare package:name with no path", () => {
+      // `package:my_app` names a package, not a file; slicing it as if a
+      // path followed would resolve lib/ itself or throw.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "lib/main.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      expect(dartResolve("package:my_app", "lib/main.dart", project, map)).toBeNull();
+    });
+
+    it("returns null for package:name/ with an empty path instead of hitting a decoy", () => {
+      // The extension fallbacks in resolveRelativePath would otherwise
+      // resolve the bare lib target onto `lib.dart` or `lib/index.dart` —
+      // an invented edge to a file the import never names.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "lib.dart": "",
+        "lib/index.dart": "",
+        "lib/main.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      expect(dartResolve("package:my_app/", "lib/main.dart", project, map)).toBeNull();
+    });
+
+    it("still resolves relative imports when a map is present", () => {
+      // The map must only add resolutions, never steal the relative path
+      // branch that already worked.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "lib/main.dart": "",
+        "lib/utils/helpers.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      const result = dartResolve("utils/helpers.dart", "lib/main.dart", project, map);
+
+      expect(result).toBe("lib/utils/helpers.dart");
+    });
+
+    it("keeps dart: imports external even with a map present", () => {
+      // The SDK scheme must never resolve into the project, whatever the
+      // map contains — the classifier narrowing must not have widened it.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "lib/main.dart": "",
+        "lib/async.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      expect(dartResolve("dart:async", "lib/main.dart", project, map)).toBeNull();
+    });
+  });
+
+  describe("buildDartPackageMap", () => {
+    it("maps the root pubspec to '.' and nested pubspecs to their directories", () => {
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "packages/feature_a/pubspec.yaml": "name: feature_a\n",
+      });
+
+      const map = buildDartPackageMap(project.root);
+
+      expect(map.get("my_app")).toBe(".");
+      expect(map.get("feature_a")).toBe("packages/feature_a");
+    });
+
+    it("reads a manifest that starts with a UTF-8 BOM", () => {
+      // `dart pub get` accepts a BOM'd pubspec, but the BOM sits before the
+      // first line's `name:` and defeats a column-0 anchor — the package
+      // would silently lose every package: edge, the exact #106 symptom.
+      project = createTempProject({
+        "pubspec.yaml": "\uFEFFname: my_app\n",
+      });
+
+      const map = buildDartPackageMap(project.root);
+
+      expect(map.get("my_app")).toBe(".");
+    });
+
+    it("reads quoted names", () => {
+      // YAML allows quoting scalars; both quote styles must yield the same
+      // name as the bare spelling.
+      project = createTempProject({
+        "a/pubspec.yaml": 'name: "alpha_pkg"\n',
+        "b/pubspec.yaml": "name: 'beta_pkg'\n",
+      });
+
+      const map = buildDartPackageMap(project.root);
+
+      expect(map.get("alpha_pkg")).toBe("a");
+      expect(map.get("beta_pkg")).toBe("b");
+    });
+
+    it("ignores indented name: keys inside dependency blocks", () => {
+      // A hosted-dependency block legitimately contains a nested `name:`.
+      // An unanchored match would map the DEPENDENCY's name to this
+      // package's root and invent edges into the wrong directory.
+      project = createTempProject({
+        "pubspec.yaml":
+          "name: my_app\ndependencies:\n  dep_pkg:\n    hosted:\n      name: hosted_dep\n      url: https://some-pub-server.example\n    version: ^1.0.0\n",
+      });
+
+      const map = buildDartPackageMap(project.root);
+
+      expect(map.get("my_app")).toBe(".");
+      expect(map.has("hosted_dep")).toBe(false);
+    });
+
+    it("contributes nothing from a manifest whose only name: is indented", () => {
+      // The anchored regex must not fall back to an indented key when no
+      // top-level one exists.
+      project = createTempProject({
+        "broken/pubspec.yaml": "description: no top-level name here\nmeta:\n  name: nested_only\n",
+      });
+
+      const map = buildDartPackageMap(project.root);
+
+      expect(map.size).toBe(0);
+    });
+
+    it("skips pubspecs under .dart_tool even when a negation re-includes it", () => {
+      // Flutter codegen writes .dart_tool/flutter_gen/pubspec.yaml; mapping
+      // it would register a package root over generated state. The default
+      // ignore list covers .dart_tool too, so the fixture re-includes it via
+      // a .socraticodeignore negation — only the walk's unconditional skip
+      // stands between the generated manifest and the map, which is exactly
+      // the case the skip exists for.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        ".socraticodeignore": "!.dart_tool/\n",
+        ".dart_tool/flutter_gen/pubspec.yaml": "name: flutter_gen\n",
+      });
+
+      const map = buildDartPackageMap(project.root);
+
+      expect(map.get("my_app")).toBe(".");
+      expect(map.has("flutter_gen")).toBe(false);
+    });
+
+    it("is first-wins in sorted path order for duplicate names", () => {
+      // Duplicate names across nested pubspecs are invalid in one pub
+      // resolution context but can exist in a monorepo tree; without a
+      // deterministic tie-break the graph's edges would differ between
+      // rebuilds on different machines.
+      project = createTempProject({
+        "zeta/pubspec.yaml": "name: dup_pkg\n",
+        "alpha/pubspec.yaml": "name: dup_pkg\n",
+      });
+
+      const map = buildDartPackageMap(project.root);
+
+      expect(map.get("dup_pkg")).toBe("alpha");
     });
   });
 
@@ -634,8 +3273,11 @@ describe("graph-resolution", () => {
     });
   });
 
-  describe("Bash resolution", () => {
-    it("resolves relative source paths", () => {
+  describe("Shell resolution", () => {
+    // resolveImport accepts two spellings: the ast-grep grammar name ("bash")
+    // and the display name from getLanguageFromExtension ("shell"), which is
+    // what buildCodeGraph passes. Both must resolve.
+    it("resolves relative source paths for the ast-grep grammar spelling", () => {
       project = createTempProject({
         "run.sh": "",
         "config.sh": "",
@@ -650,6 +3292,210 @@ describe("graph-resolution", () => {
       );
 
       expect(result).toBe("config.sh");
+    });
+
+    it("resolves relative source paths for the shell display-name spelling", () => {
+      project = createTempProject({
+        "run.sh": "",
+        "config.sh": "",
+      });
+
+      const result = resolveImport(
+        "./config.sh",
+        path.join(project.root, "run.sh"),
+        project.root,
+        project.fileSet,
+        "shell",
+      );
+
+      expect(result).toBe("config.sh");
+    });
+
+    it("resolves parent-relative source paths", () => {
+      project = createTempProject({
+        "nested/deep/run.sh": "",
+        "nested/helper.sh": "",
+        "helper.sh": "",
+      });
+
+      // A leading run of `.`/`..` anchors, so more than one level has to resolve,
+      // and an empty segment from `//` does not end the run.
+      for (const [specifier, expected] of [
+        ["../helper.sh", "nested/helper.sh"],
+        ["../../helper.sh", "helper.sh"],
+        [".//../helper.sh", "nested/helper.sh"],
+      ]) {
+        const result = resolveImport(
+          specifier,
+          path.join(project.root, "nested/deep/run.sh"),
+          project.root,
+          project.fileSet,
+          "shell",
+        );
+
+        expect(result, specifier).toBe(expected);
+      }
+    });
+
+    it("resolves a forward subdirectory path with a punctuated, mixed-case name", () => {
+      project = createTempProject({
+        "scripts/run.sh": "",
+        "scripts/lib/My_helper-2.sh": "",
+      });
+
+      // A literal path is matched verbatim, so ordinary filename punctuation and
+      // casing must survive the screens above the resolver.
+      const result = resolveImport(
+        "./lib/My_helper-2.sh",
+        path.join(project.root, "scripts/run.sh"),
+        project.root,
+        project.fileSet,
+        "shell",
+      );
+
+      expect(result).toBe("scripts/lib/My_helper-2.sh");
+    });
+
+    it("does not resolve a specifier without a ./ or ../ prefix", () => {
+      project = createTempProject({
+        "run.sh": "",
+        "config.sh": "",
+        "lib/util.sh": "",
+      });
+
+      // `source config.sh` searches PATH, then the run-time cwd when bash is not
+      // in POSIX mode, and `source lib/util.sh` is cwd-relative. Either can land
+      // on a same-named file, but never on one knowable at index time, so neither
+      // implies an edge to the sibling here.
+      for (const specifier of ["config.sh", "lib/util.sh"]) {
+        const result = resolveImport(
+          specifier,
+          path.join(project.root, "run.sh"),
+          project.root,
+          project.fileSet,
+          "shell",
+        );
+
+        expect(result, specifier).toBeNull();
+      }
+    });
+
+    // Shell performs no extension search, so resolution is literal: the two
+    // cases below are the shapes a candidate extension list would resolve, and
+    // each must stay null. The siblings cover both `.bash` and `.zsh`, and an
+    // extensionless specifier sits alongside, so these fail for any list
+    // containing `.sh`, `.bash`, or `.zsh`.
+    it("does not substitute a same-stem sibling for a missing source target", () => {
+      project = createTempProject({
+        "run.sh": "",
+        "config.bash": "",
+        "config.zsh": "",
+      });
+
+      const result = resolveImport(
+        "./config.sh",
+        path.join(project.root, "run.sh"),
+        project.root,
+        project.fileSet,
+        "shell",
+      );
+
+      expect(result).toBeNull();
+    });
+
+    it("does not append an extension to an extensionless source specifier", () => {
+      project = createTempProject({
+        "run.sh": "",
+        "config.sh": "",
+      });
+
+      const result = resolveImport(
+        "./config",
+        path.join(project.root, "run.sh"),
+        project.root,
+        project.fileSet,
+        "shell",
+      );
+
+      expect(result).toBeNull();
+    });
+
+    it("does not resolve a `..` that cancels a named segment", () => {
+      project = createTempProject({
+        "scripts/run.sh": "",
+        "scripts/lib.sh": "",
+      });
+
+      // Each of these normalises onto scripts/lib.sh, a file the script never
+      // names. The first needs no shell syntax at all — the segment simply does
+      // not exist, which the shell discovers by walking components.
+      for (const specifier of ["./nosuchdir/../lib.sh", "./$DIR/../lib.sh", "./*/../lib.sh"]) {
+        const result = resolveImport(
+          specifier,
+          path.join(project.root, "scripts/run.sh"),
+          project.root,
+          project.fileSet,
+          "shell",
+        );
+
+        expect(result, specifier).toBeNull();
+      }
+    });
+
+    it("does not normalise a directory-shaped specifier onto the same-named file", () => {
+      project = createTempProject({
+        "run.sh": "",
+        "lib.sh": "",
+      });
+
+      for (const specifier of ["./lib.sh/", "./lib.sh/."]) {
+        const result = resolveImport(
+          specifier,
+          path.join(project.root, "run.sh"),
+          project.root,
+          project.fileSet,
+          "shell",
+        );
+
+        expect(result, specifier).toBeNull();
+      }
+    });
+
+    // Asserted on the predicate rather than through resolveImport because the
+    // backslash screen only alters resolution on win32: `path.resolve` treats `\`
+    // as a separator there, while on POSIX it is an ordinary character and such a
+    // specifier misses the file set either way.
+    it("screens non-literal shapes and admits literal ones", () => {
+      for (const specifier of ["./x\\..\\lib.sh", "./x/../lib.sh", "./lib.sh/", "./lib.sh/.", "./a b/lib.sh"]) {
+        expect(hasLiteralShellPathShape(specifier), specifier).toBe(false);
+      }
+
+      for (const specifier of ["./lib.sh", "../lib.sh", "../../lib.sh", ".//../lib.sh", "./lib/My_helper-2.sh"]) {
+        expect(hasLiteralShellPathShape(specifier), specifier).toBe(true);
+      }
+    });
+
+    it("does not resolve a specifier containing whitespace", () => {
+      project = createTempProject({
+        "run.sh": "",
+        "lib.sh": "",
+        "dir name/lib.sh": "",
+      });
+
+      // The captured specifier is the whole argument list, so any whitespace-class
+      // character disqualifies it: unquoted, the shell word-splits and loads
+      // nothing; quoted, it is not a bare path.
+      for (const specifier of ["./dir name/lib.sh", "./lib.sh --verbose"]) {
+        const result = resolveImport(
+          specifier,
+          path.join(project.root, "run.sh"),
+          project.root,
+          project.fileSet,
+          "shell",
+        );
+
+        expect(result, specifier).toBeNull();
+      }
     });
   });
 
@@ -674,7 +3520,10 @@ describe("graph-resolution", () => {
   // ── Go resolution ──────────────────────────────────────────────────────
 
   describe("Go resolution", () => {
-    it("returns null (Go requires go.mod analysis)", () => {
+    it("returns null when no goModuleInfo is supplied (no go.mod path active)", () => {
+      // Back-compat: when the resolver is called without Go module info
+      // (e.g. for projects with no go.mod), every Go import resolves to
+      // null. This is the path before issue #45's fix.
       project = createTempProject({
         "main.go": "",
         "internal/helper.go": "",
@@ -688,6 +3537,549 @@ describe("graph-resolution", () => {
         "go",
       );
 
+      expect(result).toBeNull();
+    });
+
+    it("resolves a subpackage import to the representative .go file (#45)", () => {
+      project = createTempProject({
+        "go.mod": "module example.com/myapp\n\ngo 1.21\n",
+        "main.go": "",
+        "internal/helper.go": "",
+        "internal/util.go": "",
+      });
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root);
+      expect(goInfo).toHaveLength(1);
+
+      const result = resolveImport(
+        "example.com/myapp/internal",
+        path.join(project.root, "main.go"),
+        project.root,
+        project.fileSet,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goInfo,
+      );
+
+      // helper.go is the lexically smallest non-test .go file in
+      // internal/, so it's picked as the package's representative.
+      expect(result).toBe("internal/helper.go");
+    });
+
+    it("resolves the root-package import to a project-root .go file", () => {
+      project = createTempProject({
+        "go.mod": "module example.com/myapp\n\ngo 1.21\n",
+        "main.go": "",
+        "doc.go": "",
+        "internal/helper.go": "",
+      });
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root);
+
+      const result = resolveImport(
+        "example.com/myapp",
+        path.join(project.root, "internal/helper.go"),
+        project.root,
+        project.fileSet,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goInfo,
+      );
+
+      expect(result).toBe("doc.go");
+    });
+
+    it("returns null for external imports (not under module path)", () => {
+      project = createTempProject({
+        "go.mod": "module example.com/myapp\n\ngo 1.21\n",
+        "main.go": "",
+      });
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root);
+
+      const result = resolveImport(
+        "github.com/spf13/cobra",
+        path.join(project.root, "main.go"),
+        project.root,
+        project.fileSet,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goInfo,
+      );
+
+      expect(result).toBeNull();
+    });
+
+    it("returns null when go.mod is missing", () => {
+      project = createTempProject({
+        "main.go": "",
+      });
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root);
+
+      // No go.mod on disk → buildGoModuleInfo returns [] → resolver
+      // returns null for any Go import.
+      expect(goInfo).toEqual([]);
+    });
+
+    it("returns null when go.mod has no module directive", () => {
+      project = createTempProject({
+        "go.mod": "go 1.21\n",
+        "main.go": "",
+      });
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root);
+
+      // go.mod parses but has no module directive → skipped → [].
+      expect(goInfo).toEqual([]);
+    });
+
+    it("excludes _test.go files from representative selection", () => {
+      // service/foo.go and service/foo_test.go both exist in the same
+      // directory. The map's representative should be foo.go (the
+      // non-test file), not foo_test.go.
+      project = createTempProject({
+        "go.mod": "module example.com/myapp\n\ngo 1.21\n",
+        "service/foo.go": "",
+        "service/foo_test.go": "",
+        "main.go": "",
+      });
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root);
+
+      const result = resolveImport(
+        "example.com/myapp/service",
+        path.join(project.root, "main.go"),
+        project.root,
+        project.fileSet,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goInfo,
+      );
+
+      expect(result).toBe("service/foo.go");
+    });
+
+    it("uses lexically smallest non-test file as the representative (determinism)", () => {
+      project = createTempProject({
+        "go.mod": "module example.com/myapp\n\ngo 1.21\n",
+        "pkg/zeta.go": "",
+        "pkg/alpha.go": "",
+        "pkg/middle.go": "",
+        "main.go": "",
+      });
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root);
+
+      const result = resolveImport(
+        "example.com/myapp/pkg",
+        path.join(project.root, "main.go"),
+        project.root,
+        project.fileSet,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goInfo,
+      );
+
+      expect(result).toBe("pkg/alpha.go");
+    });
+
+    it("resolves local imports when the module path starts with golang.org/", () => {
+      // Real-world case: someone working ON one of the Go-team packages
+      // like golang.org/x/sync. Their go.mod declares
+      // `module golang.org/x/sync` and internal subpackages must resolve
+      // locally, even though isExternalModule treats `golang.org/...`
+      // imports as external for non-local-module projects.
+      project = createTempProject({
+        "go.mod": "module golang.org/x/custom\n\ngo 1.21\n",
+        "main.go": "",
+        "internal/foo.go": "",
+      });
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root);
+
+      const result = resolveImport(
+        "golang.org/x/custom/internal",
+        path.join(project.root, "main.go"),
+        project.root,
+        project.fileSet,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goInfo,
+      );
+
+      expect(result).toBe("internal/foo.go");
+    });
+
+    it("returns null for a similar-prefix import that is not a subpackage", () => {
+      // `example.com/myapp-other/pkg` shares the prefix `example.com/myapp`
+      // textually but is a separate module. Must not resolve to anything
+      // inside the local project.
+      project = createTempProject({
+        "go.mod": "module example.com/myapp\n\ngo 1.21\n",
+        "pkg/foo.go": "",
+        "main.go": "",
+      });
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root);
+
+      const result = resolveImport(
+        "example.com/myapp-other/pkg",
+        path.join(project.root, "main.go"),
+        project.root,
+        project.fileSet,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goInfo,
+      );
+
+      expect(result).toBeNull();
+    });
+  });
+
+  describe("buildGoModuleInfo", () => {
+    it("parses a simple go.mod and returns module path + package map", () => {
+      project = createTempProject({
+        "go.mod": "module example.com/myapp\n\ngo 1.21\n",
+        "main.go": "",
+        "internal/helper.go": "",
+        "internal/util.go": "",
+      });
+
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root)[0];
+
+      expect(goInfo).toBeDefined();
+      expect(goInfo?.modulePath).toBe("example.com/myapp");
+      // Root package
+      expect(goInfo?.packageMap.get(".")).toBe("main.go");
+      // Subpackage — first lex-sorted file wins
+      expect(goInfo?.packageMap.get("internal")).toBe("internal/helper.go");
+    });
+
+    it("parses go.mod with leading whitespace and trailing content", () => {
+      project = createTempProject({
+        "go.mod": "  module github.com/user/repo\n\ngo 1.21\n\nrequire (\n\tgithub.com/x/y v1.0.0\n)\n",
+        "main.go": "",
+      });
+
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root)[0];
+
+      expect(goInfo?.modulePath).toBe("github.com/user/repo");
+    });
+
+    it("returns an empty array when go.mod is missing", () => {
+      project = createTempProject({
+        "main.go": "",
+      });
+
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root);
+
+      expect(goInfo).toEqual([]);
+    });
+
+    it("returns an empty array when go.mod has no module directive", () => {
+      project = createTempProject({
+        "go.mod": "// no module line\ngo 1.21\n",
+        "main.go": "",
+      });
+
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root);
+
+      expect(goInfo).toEqual([]);
+    });
+
+    it("excludes _test.go files from the package map representatives", () => {
+      project = createTempProject({
+        "go.mod": "module example.com/myapp\n",
+        "service/foo_test.go": "",
+        "service/foo.go": "",
+      });
+
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root)[0];
+
+      expect(goInfo?.packageMap.get("service")).toBe("service/foo.go");
+    });
+
+    it("does not include directories that contain only _test.go files", () => {
+      project = createTempProject({
+        "go.mod": "module example.com/myapp\n",
+        "internal/only_test.go": "",
+        "main.go": "",
+      });
+
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root)[0];
+
+      // Map has "." (for main.go) but no "internal" entry, because the
+      // only file there is a test file.
+      expect(goInfo?.packageMap.has(".")).toBe(true);
+      expect(goInfo?.packageMap.has("internal")).toBe(false);
+    });
+
+    it("uses forward-slash keys for nested packages (cross-platform lookup)", () => {
+      // Go imports always use forward slashes; the map keys must match
+      // that form so resolution works on Windows, where path.dirname
+      // would otherwise produce backslash-separated keys for nested
+      // packages. The map value preserves the fileSet's native form
+      // (test fixtures use forward slashes since createTempProject keys
+      // its fileSet by the input relPath).
+      project = createTempProject({
+        "go.mod": "module example.com/myapp\n",
+        "pkg/subpkg/file.go": "",
+      });
+
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root)[0];
+
+      expect(goInfo?.packageMap.has("pkg/subpkg")).toBe(true);
+      expect(goInfo?.packageMap.get("pkg/subpkg")).toBe("pkg/subpkg/file.go");
+    });
+
+    it("resolves nested-package imports", () => {
+      project = createTempProject({
+        "go.mod": "module example.com/myapp\n",
+        "pkg/subpkg/file.go": "",
+        "main.go": "",
+      });
+      const goInfo = buildGoModuleInfo(project.fileSet, project.root);
+
+      const result = resolveImport(
+        "example.com/myapp/pkg/subpkg",
+        path.join(project.root, "main.go"),
+        project.root,
+        project.fileSet,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goInfo,
+      );
+
+      expect(result).toBe("pkg/subpkg/file.go");
+    });
+  });
+
+  // ── Nested go.mod (monorepo, issue #82) ───────────────────────────────
+  // These cover the case the original #45 fix did not handle: go.mod sits
+  // in a subdirectory of the indexed root. buildGoModuleInfo must discover
+  // it by walking the tree (go.mod is never in the graphable file set) and
+  // offset the package-directory lookup by the module's own subdirectory.
+  describe("Go resolution with nested go.mod (monorepo, #82)", () => {
+    it("discovers a nested go.mod and resolves imports against it", () => {
+      // go.mod lives in `backend/`, not at the indexed root. Imports are
+      // rooted at the module path and must be offset by the module's own
+      // subdirectory before the file lookup.
+      project = createTempProject({
+        "backend/go.mod": "module github.com/example/myapp-backend\n\ngo 1.22\n",
+        "backend/cmd/server/main.go": "",
+        "backend/internal/middleware/auth.go": "",
+        "backend/internal/service/user.go": "",
+        "frontend/src/app.ts": "",
+      });
+      const goModules = buildGoModuleInfo(project.fileSet, project.root);
+      expect(goModules).toHaveLength(1);
+      expect(goModules[0].moduleDir).toBe("backend");
+      expect(goModules[0].modulePath).toBe("github.com/example/myapp-backend");
+
+      const result = resolveImport(
+        "github.com/example/myapp-backend/internal/middleware",
+        path.join(project.root, "backend/cmd/server/main.go"),
+        project.root,
+        project.fileSet,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goModules,
+      );
+
+      // Resolved back to a project-relative path (module dir + module-
+      // relative file), not a module-relative one.
+      expect(result).toBe("backend/internal/middleware/auth.go");
+    });
+
+    it("resolves the module's own root package when go.mod is nested", () => {
+      project = createTempProject({
+        "backend/go.mod": "module github.com/example/myapp-backend\n\ngo 1.22\n",
+        "backend/main.go": "",
+        "backend/internal/helper.go": "",
+      });
+      const goModules = buildGoModuleInfo(project.fileSet, project.root);
+
+      const result = resolveImport(
+        "github.com/example/myapp-backend",
+        path.join(project.root, "backend/internal/helper.go"),
+        project.root,
+        project.fileSet,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goModules,
+      );
+
+      expect(result).toBe("backend/main.go");
+    });
+
+    it("attributes a nested module's files to it, not to a root module", () => {
+      // Two modules: one at the root, one nested under `backend/`. Files
+      // under `backend/` must resolve only via the nested module's path
+      // and never collide with the root module's package map.
+      project = createTempProject({
+        "go.mod": "module github.com/example/root\n\ngo 1.22\n",
+        "rootpkg/foo.go": "",
+        "backend/go.mod": "module github.com/example/backend\n\ngo 1.22\n",
+        "backend/svc/bar.go": "",
+      });
+      const goModules = buildGoModuleInfo(project.fileSet, project.root);
+      expect(goModules).toHaveLength(2);
+
+      const backend = goModules.find((m) => m.moduleDir === "backend");
+      expect(backend).toBeDefined();
+      // packageMap keys are MODULE-relative (the module dir is stripped).
+      expect(backend?.packageMap.get("svc")).toBe("backend/svc/bar.go");
+      // The root module must not have picked up the nested file.
+      const root = goModules.find((m) => m.moduleDir === ".");
+      expect(root).toBeDefined();
+      expect(root?.packageMap.has("backend/svc")).toBe(false);
+
+      const result = resolveImport(
+        "github.com/example/backend/svc",
+        path.join(project.root, "backend/svc/bar.go"),
+        project.root,
+        project.fileSet,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goModules,
+      );
+      expect(result).toBe("backend/svc/bar.go");
+    });
+
+    it("owns a nested module under a single-character dir `z/` (depth tie-break, #82 review)", () => {
+      // The deepest-module tie-break must use directory DEPTH, not string
+      // length: the root module is `"."` (string length 1) and a nested
+      // module under `z/` is `"z"` (also string length 1). A string-length
+      // comparison ties them and the winner becomes order-dependent, so
+      // `z/svc/bar.go` can be mis-attributed to the root module. Directory
+      // depth (`.` = 0, `z` = 1) attributes it correctly to the nested one.
+      project = createTempProject({
+        "go.mod": "module github.com/example/root\n",
+        "main.go": "",
+        "z/go.mod": "module github.com/example/z\n",
+        "z/svc/bar.go": "",
+      });
+      const goModules = buildGoModuleInfo(project.fileSet, project.root);
+      expect(goModules).toHaveLength(2);
+
+      const zMod = goModules.find((m) => m.moduleDir === "z");
+      expect(zMod).toBeDefined();
+      expect(zMod?.packageMap.get("svc")).toBe("z/svc/bar.go");
+      // The root module must not have absorbed the nested file under its
+      // project-relative path.
+      const rootMod = goModules.find((m) => m.moduleDir === ".");
+      expect(rootMod?.packageMap.has("z/svc")).toBe(false);
+
+      const result = resolveImport(
+        "github.com/example/z/svc",
+        path.join(project.root, "z/svc/bar.go"),
+        project.root,
+        project.fileSet,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goModules,
+      );
+      expect(result).toBe("z/svc/bar.go");
+    });
+
+    it("matches the longest module path that is a structural (not textual) prefix", () => {
+      // Modules `github.com/x` (root) and `github.com/x/y` (nested). The
+      // import `github.com/x/yother` shares the textual prefix
+      // `github.com/x/y` but is NOT a subpackage of `github.com/x/y` — it
+      // is the `yother` package of the root module `github.com/x`.
+      // Structural matching (exact or `/`-delimited) routes it correctly;
+      // a bare startsWith would misroute it to `github.com/x/y` and fail.
+      project = createTempProject({
+        "go.mod": "module github.com/x\n\ngo 1.22\n",
+        "yother/z.go": "",
+        "x/y/go.mod": "module github.com/x/y\n\ngo 1.22\n",
+        "x/y/main.go": "",
+      });
+      const goModules = buildGoModuleInfo(project.fileSet, project.root);
+      expect(goModules).toHaveLength(2);
+
+      const result = resolveImport(
+        "github.com/x/yother",
+        path.join(project.root, "x/y/main.go"),
+        project.root,
+        project.fileSet,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goModules,
+      );
+      expect(result).toBe("yother/z.go");
+    });
+
+    it("discovers go.mod from disk even when it is absent from the file set", () => {
+      // The regression that sank the first #82 attempt: buildGoModuleInfo
+      // must NOT rely on go.mod being in the graphable file set, because
+      // getGraphableFiles never admits go.mod (no AST grammar). Drop every
+      // go.mod entry from the file set and confirm modules are still
+      // discovered via the tree walk and imports still resolve.
+      project = createTempProject({
+        "backend/go.mod": "module github.com/example/myapp-backend\n\ngo 1.22\n",
+        "backend/internal/middleware/auth.go": "",
+        "backend/cmd/server/main.go": "",
+      });
+      const fileSetWithoutGoMod = new Set(
+        [...project.fileSet].filter((f) => !f.endsWith("go.mod")),
+      );
+
+      const goModules = buildGoModuleInfo(fileSetWithoutGoMod, project.root);
+      expect(goModules).toHaveLength(1);
+      expect(goModules[0].moduleDir).toBe("backend");
+
+      const result = resolveImport(
+        "github.com/example/myapp-backend/internal/middleware",
+        path.join(project.root, "backend/cmd/server/main.go"),
+        project.root,
+        fileSetWithoutGoMod,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goModules,
+      );
+      expect(result).toBe("backend/internal/middleware/auth.go");
+    });
+
+    it("returns null for Go imports when no go.mod exists anywhere", () => {
+      project = createTempProject({
+        "backend/main.go": "",
+        "frontend/src/app.ts": "",
+      });
+      const goModules = buildGoModuleInfo(project.fileSet, project.root);
+      expect(goModules).toEqual([]);
+
+      const result = resolveImport(
+        "github.com/example/anything/internal",
+        path.join(project.root, "backend/main.go"),
+        project.root,
+        project.fileSet,
+        "go",
+        undefined,
+        undefined,
+        undefined,
+        goModules,
+      );
       expect(result).toBeNull();
     });
   });

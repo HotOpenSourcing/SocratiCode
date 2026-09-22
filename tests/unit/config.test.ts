@@ -5,7 +5,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { collectionName, contextCollectionName, detectGitBranch, graphCollectionName, loadLinkedProjects, projectIdFromPath, resolveLinkedCollections, sanitizeBranchName } from "../../src/config.js";
+import {
+  collectionName,
+  contextCollectionName,
+  detectGitBranch,
+  graphCollectionName,
+  loadLinkedProjects,
+  loadPythonRoots,
+  projectIdFromPath,
+  resolveLinkedCollections,
+  sanitizeBranchName,
+} from "../../src/config.js";
 
 describe("config", () => {
   // Clean up env overrides between tests
@@ -243,6 +253,83 @@ describe("config", () => {
     });
   });
 
+  describe("loadPythonRoots", () => {
+    let tmpDir: string;
+    let projectDir: string;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-python-roots-"));
+      projectDir = path.join(tmpDir, "project");
+      fs.mkdirSync(path.join(projectDir, "dags"), { recursive: true });
+      fs.mkdirSync(path.join(projectDir, "services", "api"), { recursive: true });
+      fs.mkdirSync(path.join(tmpDir, "outside"), { recursive: true });
+      fs.writeFileSync(path.join(projectDir, "not-a-directory.py"), "pass\n");
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("returns no roots when the setting is absent, empty, or malformed", () => {
+      expect(loadPythonRoots(projectDir)).toEqual([]);
+
+      fs.writeFileSync(
+        path.join(projectDir, ".socraticode.json"),
+        JSON.stringify({ pythonRoots: [] }),
+      );
+      expect(loadPythonRoots(projectDir)).toEqual([]);
+
+      fs.writeFileSync(path.join(projectDir, ".socraticode.json"), "not json");
+      expect(loadPythonRoots(projectDir)).toEqual([]);
+
+      fs.writeFileSync(
+        path.join(projectDir, ".socraticode.json"),
+        JSON.stringify({ pythonRoots: "dags" }),
+      );
+      expect(loadPythonRoots(projectDir)).toEqual([]);
+    });
+
+    it("normalizes and deduplicates valid directories in declared order", () => {
+      fs.writeFileSync(
+        path.join(projectDir, ".socraticode.json"),
+        JSON.stringify({
+          pythonRoots: [" services/api ", "dags/../dags", "dags", "services\\api"],
+        }),
+      );
+
+      expect(loadPythonRoots(projectDir)).toEqual(["services/api", "dags"]);
+    });
+
+    it("rejects absolute, outside-root, missing, and non-directory entries", () => {
+      fs.writeFileSync(
+        path.join(projectDir, ".socraticode.json"),
+        JSON.stringify({
+          pythonRoots: [
+            path.join(tmpDir, "outside"),
+            "C:\\outside",
+            "../outside",
+            "missing",
+            "not-a-directory.py",
+            42,
+            null,
+          ],
+        }),
+      );
+
+      expect(loadPythonRoots(projectDir)).toEqual([]);
+    });
+
+    it.runIf(process.platform !== "win32")("rejects a symlink that escapes the project", () => {
+      fs.symlinkSync(path.join(tmpDir, "outside"), path.join(projectDir, "outside-link"));
+      fs.writeFileSync(
+        path.join(projectDir, ".socraticode.json"),
+        JSON.stringify({ pythonRoots: ["outside-link"] }),
+      );
+
+      expect(loadPythonRoots(projectDir)).toEqual([]);
+    });
+  });
+
   describe("resolveLinkedCollections", () => {
     let tmpDir: string;
     let projectDir: string;
@@ -316,6 +403,88 @@ describe("config", () => {
       expect(linkedNameWithBranch).toBe(linkedNameWithoutBranch);
       // And must NOT contain a branch suffix (double-underscore)
       expect(linkedNameWithBranch).not.toContain("__");
+    });
+
+    it("honors a linked project's committed projectId", () => {
+      // Symmetry guarantee: the same project must resolve to the same
+      // Qdrant collection whether it's the current root or a linked
+      // dependency from another project. Without this, cross-project
+      // search would silently miss the linked project's data when that
+      // project pins its id via .socraticode.json.
+      fs.writeFileSync(
+        path.join(linkedDir, ".socraticode.json"),
+        JSON.stringify({ projectId: "linked-stable" }),
+      );
+      fs.writeFileSync(
+        path.join(projectDir, ".socraticode.json"),
+        JSON.stringify({ linkedProjects: ["../linked-lib"] }),
+      );
+
+      const collections = resolveLinkedCollections(projectDir);
+      expect(collections).toHaveLength(2);
+      expect(collections[1].name).toBe("codebase_linked-stable");
+    });
+
+    it("dedups linked projects that share a committed projectId with the current project", () => {
+      // Two physically distinct paths can declare the same shared
+      // projectId — they point to the same Qdrant collection, so the
+      // current project must not be queried twice (once as "self" and
+      // once as "linked").
+      fs.writeFileSync(
+        path.join(linkedDir, ".socraticode.json"),
+        JSON.stringify({ projectId: "shared-team-id" }),
+      );
+      fs.writeFileSync(
+        path.join(projectDir, ".socraticode.json"),
+        JSON.stringify({ projectId: "shared-team-id", linkedProjects: ["../linked-lib"] }),
+      );
+
+      const collections = resolveLinkedCollections(projectDir);
+      expect(collections).toHaveLength(1);
+      expect(collections[0].name).toBe("codebase_shared-team-id");
+    });
+
+    it("does not wrongly dedup a linked project when env override diverges from file projectId", () => {
+      // Regression for a subtle dedup misalignment: the dedup seed used
+      // the file-only `effectiveBaseProjectId`, while the current
+      // project's collection name comes from the env-aware
+      // `projectIdFromPath`. When `SOCRATICODE_PROJECT_ID` is set on the
+      // current project AND both projects pin the same `projectId` in
+      // their `.socraticode.json`, the two computations disagreed and
+      // the linked project was wrongly skipped — losing its data even
+      // though it lives in a collection genuinely distinct from the
+      // env-overridden current one.
+      process.env.SOCRATICODE_PROJECT_ID = "env-override";
+      fs.writeFileSync(
+        path.join(linkedDir, ".socraticode.json"),
+        JSON.stringify({ projectId: "shared-id" }),
+      );
+      fs.writeFileSync(
+        path.join(projectDir, ".socraticode.json"),
+        JSON.stringify({ projectId: "shared-id", linkedProjects: ["../linked-lib"] }),
+      );
+
+      const collections = resolveLinkedCollections(projectDir);
+      expect(collections).toHaveLength(2);
+      expect(collections[0].name).toBe("codebase_env-override");
+      expect(collections[1].name).toBe("codebase_shared-id");
+    });
+
+    it("does not leak SOCRATICODE_PROJECT_ID env var into linked-project collection names", () => {
+      // The env var is process-scoped and applies only to the current
+      // project. Without this guard, linked projects would all collapse
+      // onto the env-var collection name — wrong and silently lossy.
+      process.env.SOCRATICODE_PROJECT_ID = "current-only";
+      fs.writeFileSync(
+        path.join(projectDir, ".socraticode.json"),
+        JSON.stringify({ linkedProjects: ["../linked-lib"] }),
+      );
+
+      const collections = resolveLinkedCollections(projectDir);
+      expect(collections).toHaveLength(2);
+      expect(collections[0].name).toBe("codebase_current-only");
+      expect(collections[1].name).toMatch(/^codebase_[0-9a-f]{12}$/);
+      expect(collections[1].name).not.toBe("codebase_current-only");
     });
   });
 
@@ -439,6 +608,129 @@ describe("config", () => {
       process.env.SOCRATICODE_BRANCH_AWARE = "false";
       const id = projectIdFromPath(process.cwd());
       expect(id).toMatch(/^[0-9a-f]{12}$/);
+    });
+  });
+
+  // ── projectId override via .socraticode.json ────────────────────────
+  //
+  // Allow teams to commit a stable `projectId` in `.socraticode.json` so
+  // every machine that checks out the project addresses the same Qdrant
+  // collection regardless of where the working tree lives on disk.
+
+  describe("projectIdFromPath with .socraticode.json projectId", () => {
+    let tmpDir: string;
+    let projectDir: string;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-projid-"));
+      projectDir = path.join(tmpDir, "my-project");
+      fs.mkdirSync(projectDir, { recursive: true });
+      delete process.env.SOCRATICODE_PROJECT_ID;
+      delete process.env.SOCRATICODE_BRANCH_AWARE;
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    function writeConfig(config: unknown): void {
+      fs.writeFileSync(path.join(projectDir, ".socraticode.json"), JSON.stringify(config));
+    }
+
+    it("uses projectId from .socraticode.json when env var is not set", () => {
+      writeConfig({ projectId: "team-shared-ios" });
+      expect(projectIdFromPath(projectDir)).toBe("team-shared-ios");
+    });
+
+    it("ignores path differences when file projectId is set", () => {
+      // Two different projects on disk both pin to the same id — they should share collections.
+      const otherDir = path.join(tmpDir, "another-project");
+      fs.mkdirSync(otherDir, { recursive: true });
+      writeConfig({ projectId: "shared-id" });
+      fs.writeFileSync(
+        path.join(otherDir, ".socraticode.json"),
+        JSON.stringify({ projectId: "shared-id" }),
+      );
+      expect(projectIdFromPath(projectDir)).toBe(projectIdFromPath(otherDir));
+    });
+
+    it("trims whitespace from file projectId", () => {
+      writeConfig({ projectId: "  trimmed-id  " });
+      expect(projectIdFromPath(projectDir)).toBe("trimmed-id");
+    });
+
+    it("throws on invalid characters in file projectId", () => {
+      writeConfig({ projectId: "invalid/name" });
+      expect(() => projectIdFromPath(projectDir)).toThrow(
+        /\.socraticode\.json.*projectId.*\[a-zA-Z0-9_-\]/,
+      );
+    });
+
+    it("falls back to path hash when file projectId is empty string", () => {
+      writeConfig({ projectId: "" });
+      expect(projectIdFromPath(projectDir)).toMatch(/^[0-9a-f]{12}$/);
+    });
+
+    it("falls back to path hash when file projectId is whitespace only", () => {
+      writeConfig({ projectId: "   " });
+      expect(projectIdFromPath(projectDir)).toMatch(/^[0-9a-f]{12}$/);
+    });
+
+    it("falls back to path hash when file projectId has wrong type", () => {
+      writeConfig({ projectId: 12345 });
+      expect(projectIdFromPath(projectDir)).toMatch(/^[0-9a-f]{12}$/);
+    });
+
+    it("falls back to path hash when file projectId field is null", () => {
+      writeConfig({ projectId: null });
+      expect(projectIdFromPath(projectDir)).toMatch(/^[0-9a-f]{12}$/);
+    });
+
+    it("SOCRATICODE_PROJECT_ID env var takes precedence over file projectId", () => {
+      writeConfig({ projectId: "from-file" });
+      process.env.SOCRATICODE_PROJECT_ID = "from-env";
+      expect(projectIdFromPath(projectDir)).toBe("from-env");
+    });
+
+    it("uses file projectId when .socraticode.json is absent → falls back to hash", () => {
+      // No .socraticode.json written — current default behavior unchanged
+      expect(projectIdFromPath(projectDir)).toMatch(/^[0-9a-f]{12}$/);
+    });
+
+    it("falls back to hash when .socraticode.json is malformed JSON", () => {
+      fs.writeFileSync(path.join(projectDir, ".socraticode.json"), "not valid json{{{");
+      expect(projectIdFromPath(projectDir)).toMatch(/^[0-9a-f]{12}$/);
+    });
+
+    it("does not append branch suffix when file projectId is set", () => {
+      writeConfig({ projectId: "stable-id" });
+      process.env.SOCRATICODE_BRANCH_AWARE = "true";
+      // Initialize tmpDir as a git repo with a non-default branch to prove
+      // that branch-aware mode is suppressed by an explicit projectId.
+      // Disable gpg/ssh signing locally so the test is robust against the
+      // user's global git config (commit.gpgsign=true is common).
+      execFileSync("git", ["init", "-b", "feature-branch", projectDir]);
+      execFileSync("git", ["config", "user.name", "test"], { cwd: projectDir });
+      execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: projectDir });
+      execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: projectDir });
+      execFileSync("git", ["config", "tag.gpgsign", "false"], { cwd: projectDir });
+      execFileSync("git", ["commit", "--allow-empty", "-m", "init"], { cwd: projectDir });
+
+      const id = projectIdFromPath(projectDir);
+      expect(id).toBe("stable-id");
+      expect(id).not.toContain("__");
+    });
+
+    it("coexists with linkedProjects field in the same file", () => {
+      // Regression guard: adding projectId must not break linkedProjects parsing.
+      const linked = path.join(tmpDir, "linked");
+      fs.mkdirSync(linked, { recursive: true });
+      writeConfig({ projectId: "shared-id", linkedProjects: ["../linked"] });
+      expect(projectIdFromPath(projectDir)).toBe("shared-id");
+      // loadLinkedProjects is still happy — round-trip via resolveLinkedCollections
+      const collections = resolveLinkedCollections(projectDir);
+      expect(collections).toHaveLength(2);
+      expect(collections[0].name).toBe("codebase_shared-id");
     });
   });
 });

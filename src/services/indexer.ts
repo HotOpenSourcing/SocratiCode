@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
-import { createHash } from "node:crypto";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { type Lang, parse } from "@ast-grep/napi";
@@ -10,44 +9,60 @@ import { collectionName, projectIdFromPath } from "../config.js";
 import {
   CHUNK_OVERLAP,
   CHUNK_SIZE,
+  EXTENSION_LANGUAGE_MAP,
   EXTRA_EXTENSIONS,
   getLanguageFromExtension,
+  hashContent,
   INDEX_BATCH_SIZE,
+  indexExtensionlessEnabled,
   MAX_AVG_LINE_LENGTH,
-  MAX_CHUNK_CHARS,MAX_FILE_BYTES,
+  MAX_CHUNK_CHARS,
   SPECIAL_FILES,
   SUPPORTED_EXTENSIONS
 } from "../constants.js";
 import type { FileChunk } from "../types.js";
-import { ensureDynamicLanguages, getAstGrepLang, rebuildGraph, removeGraph } from "./code-graph.js";
+import {
+  continuationId,
+  SPLITTING_INDEX_FORMAT_VERSION,
+  splitTextToCharCap,
+  uuidFromSeed,
+} from "./chunk-split.js";
+import { ensureDynamicLanguages, gdscriptParserAvailable, getAstGrepLang, rebuildGraph, removeGraph, shouldRebuildGraph } from "./code-graph.js";
 import { ensureArtifactsIndexed, loadConfig, removeAllArtifacts } from "./context-artifacts.js";
+import { analyzeElixirTemplate, ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir-templates.js";
 import { generateEmbeddings, prepareDocumentText } from "./embeddings.js";
+import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
-import { acquireProjectLock, releaseProjectLock } from "./lock.js";
+import {
+  CURRENT_INDEX_FORMAT_VERSION,
+  documentTextProfile,
+  type EffectiveIndexProfile,
+  ensureEffectiveEmbeddingReady,
+  profileExtensionLanguageMap,
+  resolveEffectiveIndexProfile,
+  withEffectiveEmbedding,
+} from "./index-profile.js";
+import { acquireProjectLock, holdsProjectLock, releaseProjectLock } from "./lock.js";
 import { logger } from "./logger.js";
 import {
+  type CollectionInfo,
   deleteCollection,
   deleteFileChunks,
   deleteProjectMetadata,
   ensureCollection,
   getCollectionInfo,
   getProjectMetadata,
+  listIndexedFilePaths,
+  loadIndexingStatus,
+  loadProjectEffectiveProfile,
   loadProjectHashes,
   saveProjectMetadata,
   upsertPreEmbeddedChunks,
 } from "./qdrant.js";
-import { updateChangedFilesSymbolGraph } from "./symbol-graph-incremental.js";
-import { loadSymbolGraphMeta } from "./symbol-graph-store.js";
+import { assertNoReclamationBarrier } from "./reclamation-barrier.js";
 
-const FILE_SCAN_BATCH = 50; // Number of files to scan/chunk in parallel (I/O only, no network)
+export const FILE_SCAN_BATCH = 50; // Number of files to scan/chunk in parallel (I/O only, no network)
 
-/**
- * Phase F: maximum number of changed/removed files for which the watcher path
- * patches the symbol graph in-place rather than rebuilding it from scratch.
- * Above this threshold a full rebuild is faster than re-running per-file
- * extraction + shard merging, since most shards would be touched anyway.
- */
-const INCREMENTAL_SYMBOL_THRESHOLD = 50;
 
 /** State for tracking indexed files per project (loaded from Qdrant on first use) */
 const projectHashes = new Map<string, Map<string, string>>();
@@ -139,6 +154,95 @@ export function requestCancellation(projectPath: string): boolean {
   return true;
 }
 
+/**
+ * Stand down when the index lock is lost mid-run.
+ *
+ * The lock is keyed by project id and the collection is shared, so losing it
+ * means another process may now be indexing what this run is still writing to.
+ * Two writers is the state the reconciliation on resume exists to survive; not
+ * racing in the first place is better.
+ *
+ * Cancellation is checked between batches and returns before the terminal
+ * `completed` write, so the collection is left `in-progress` and the next run
+ * reconciles it. That makes standing down safe even when the compromise was
+ * spurious — the cost is one resumable run, against two processes writing to
+ * one collection.
+ *
+ * `requestCancellation` no-ops if the run is not registered yet, which cannot
+ * happen here: registration follows the lock acquisition with no `await`
+ * between them, and this runs from proper-lockfile's timer, which cannot fire
+ * during synchronous execution.
+ */
+function cancelBecauseLockWasLost(projectPath: string): void {
+  logger.warn("Index lock lost while indexing — cancelling to avoid racing the new holder", {
+    projectPath,
+  });
+  requestCancellation(projectPath);
+}
+
+/**
+ * Persist the terminal `completed` status, and undo it only while this process
+ * still owns the project lock.
+ *
+ * The gate before the call cannot close the window on its own:
+ * `saveProjectMetadata` is asynchronous and a compromise arrives from
+ * proper-lockfile's timer, so cancellation can land after the check and before
+ * the write does.
+ *
+ * The repair is therefore conditional on ownership rather than on cancellation
+ * alone. A user-requested stop leaves the lock held, so the status can safely be
+ * put back. A lost lock means another process may already have written its own
+ * status and hashes, and correcting ours would overwrite theirs — so once
+ * ownership is known to be gone, no further write is started at all. Qdrant
+ * offers no conditional upsert to distinguish the two after the fact, which is
+ * exactly why the decision is made before writing rather than after.
+ *
+ * Returns whether `completed` stands.
+ */
+async function persistCompletedUnlessLockLost(
+  collection: string,
+  resolvedPath: string,
+  filesTotal: number,
+  filesIndexed: number,
+  hashes: Map<string, string>,
+  effectiveProfile: EffectiveIndexProfile,
+): Promise<boolean> {
+  await saveProjectMetadata(
+    collection,
+    resolvedPath,
+    filesTotal,
+    filesIndexed,
+    hashes,
+    "completed",
+    effectiveProfile,
+  );
+
+  if (!isCancellationRequested(resolvedPath)) return true;
+
+  if (!holdsProjectLock(resolvedPath, "index")) {
+    logger.warn(
+      "Cancelled while completing and the lock is no longer held — leaving metadata alone rather than overwriting the new holder",
+      { projectPath: resolvedPath, collection },
+    );
+    return false;
+  }
+
+  logger.warn("Cancelled while the completed status was being written — reverting to in-progress", {
+    projectPath: resolvedPath,
+    collection,
+  });
+  await saveProjectMetadata(
+    collection,
+    resolvedPath,
+    filesTotal,
+    filesIndexed,
+    hashes,
+    "in-progress",
+    effectiveProfile,
+  );
+  return false;
+}
+
 /** Check whether cancellation has been requested for a project */
 function isCancellationRequested(resolvedPath: string): boolean {
   return cancellationRequested.get(resolvedPath) === true;
@@ -165,6 +269,68 @@ async function getProjectHashes(projectId: string, collection: string, resolvedP
     projectHashes.set(projectId, new Map());
   }
   return projectHashes.get(projectId) as Map<string, string>;
+}
+
+/**
+ * Drop hashes for files that have no chunks left in the collection.
+ *
+ * An interrupted run can leave the two out of step. The stored hashes are
+ * checkpointed as `in-progress`, then chunks for files that disappeared are
+ * deleted, and only afterwards is the pruned hash map written back. Stop
+ * between those steps — a crash, a cancellation, a host that exits — and the
+ * collection keeps hashes for points that are gone.
+ *
+ * Nothing recovers from that on its own. The next run reads the file, computes
+ * the same content hash, matches the stale entry and skips it, so the missing
+ * chunks are never rebuilt. `codebase_index` does not help either: it takes the
+ * same skip. Until now the only way back was deleting the collection and
+ * starting over.
+ *
+ * Reconciling the hash map against the points that actually exist turns that
+ * into a self-healing case: a file whose chunks are absent loses its hash, so
+ * the very next run re-indexes it.
+ *
+ * SCOPE — deliberately limited to a resume from `in-progress`.
+ *
+ * This costs one paged scroll of the collection, which is cheap next to
+ * indexing but not free: a repository of ~60k points is ~60 round trips, and a
+ * healthy incremental otherwise finishes in seconds. Running it on every index
+ * would also catch chunk loss from causes other than interruption, and that is
+ * a defensible choice — but it taxes the common path to guard against the rare
+ * one. Interruption is the failure mode with a known mechanism, and it is the
+ * one that is marked in the metadata, so it is what this checks. If loss is
+ * ever observed after a run that completed cleanly, widening this is the
+ * change to make, and the only cost is the scroll.
+ */
+async function reconcileHashesWithStoredPoints(
+  collection: string,
+  hashes: Map<string, string>,
+  projectId: string,
+): Promise<number> {
+  if (hashes.size === 0) return 0;
+
+  const present = await listIndexedFilePaths(collection);
+  // An empty collection is not evidence of loss — a fresh index legitimately has
+  // no points yet, and clearing every hash there would force a full re-embed for
+  // no reason. Only prune when there is something to compare against.
+  if (present.size === 0) return 0;
+
+  let dropped = 0;
+  for (const [relativePath] of hashes) {
+    if (!present.has(relativePath)) {
+      hashes.delete(relativePath);
+      dropped++;
+    }
+  }
+  if (dropped > 0) {
+    logger.info("Reconciled hashes against stored points; files with no chunks will be re-indexed", {
+      projectId,
+      collection,
+      filesRestored: dropped,
+      hashesRemaining: hashes.size,
+    });
+  }
+  return dropped;
 }
 
 /**
@@ -222,23 +388,27 @@ function detectCommonPrefix(hashes: Map<string, string>): string | null {
   return prefix;
 }
 
-/** Hash file content for change detection */
-export function hashContent(content: string): string {
-  return createHash("sha256").update(content).digest("hex").slice(0, 16);
-}
+// `hashContent` now lives in constants.ts, shared with the graph's input
+// recording; re-exported here because this module is where callers look for it.
+export { hashContent };
 
 /** Generate a stable chunk ID as a valid UUID (required by Qdrant) */
 export function chunkId(relativePath: string, startLine: number): string {
-  const hash = createHash("sha256").update(`${relativePath}:${startLine}`).digest("hex").slice(0, 32);
-  // Format as UUID: 8-4-4-4-12
-  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-${hash.slice(12, 16)}-${hash.slice(16, 20)}-${hash.slice(20, 32)}`;
+  return uuidFromSeed(`${relativePath}:${startLine}`);
 }
 
 /** Check if a file should be indexed based on extension or name */
-export function isIndexableFile(fileName: string, extraExts?: Set<string>): boolean {
+export function isIndexableFile(
+  fileName: string,
+  extraExts?: Set<string>,
+  extensionLanguageMap: Map<string, string> = EXTENSION_LANGUAGE_MAP,
+): boolean {
   if (SPECIAL_FILES.has(fileName)) return true;
   const ext = path.extname(fileName).toLowerCase();
   if (SUPPORTED_EXTENSIONS.has(ext)) return true;
+  // Extensions mapped to a real language via EXTENSION_LANGUAGE_MAP are
+  // first-class source files, not plaintext extras.
+  if (extensionLanguageMap.has(ext)) return true;
   // Check extra extensions (from env var + tool parameter)
   const extras = extraExts ?? EXTRA_EXTENSIONS;
   return extras.has(ext);
@@ -272,6 +442,17 @@ const TOP_LEVEL_KINDS: Record<string, string[]> = {
   php:        ["function_definition", "class_declaration", "method_declaration", "trait_declaration"],
   swift:      ["function_declaration", "class_declaration", "struct_declaration", "protocol_declaration", "extension_declaration"],
   bash:       ["function_definition"],
+  // Dart: class/mixin/enum/extension nodes span their bodies, but a top-level
+  // function is a `function_signature` followed by a SIBLING `function_body`
+  // starting on the same line. Both kinds are listed so the overlap-merge in
+  // findAstBoundaries fuses each signature/body pair into one region.
+  dart:       ["class_definition", "mixin_declaration", "enum_declaration", "extension_declaration", "type_alias", "function_signature", "function_body"],
+  elixir:     ["call"],
+  // GDScript (Godot)
+  gdscript:   ["function_definition", "class_definition", "variable_statement",
+               "export_variable_statement", "onready_variable_statement",
+               "signal_statement", "const_statement", "enum_definition",
+               "extends_statement", "class_name_statement"],
 };
 
 /** Minimum lines for a chunk to stand on its own (otherwise merge with neighbors) */
@@ -292,6 +473,10 @@ function findAstBoundaries(source: string, lang: Lang | string): AstRegion[] {
   const langKey = String(lang);
   const kinds = TOP_LEVEL_KINDS[langKey];
   if (!kinds) return [];
+  // GDScript parser is registered dynamically and may be unavailable on
+  // platforms without a compatible prebuild (e.g. linux-arm64). Skip AST
+  // chunking there — files fall back to line-based chunking.
+  if (langKey === "gdscript" && !gdscriptParserAvailable) return [];
 
   try {
     const root = parse(lang, source).root();
@@ -303,13 +488,14 @@ function findAstBoundaries(source: string, lang: Lang | string): AstRegion[] {
         // Only top-level nodes (depth 1 from root, or depth 2 for namespace/module wrappers)
         const parent = node.parent();
         const grandparent = parent?.parent();
-        const isTopLevel = !parent || parent.kind() === "program" || parent.kind() === "source_file"
+        const isTopLevel = !parent || parent.kind() === "program" || parent.kind() === "source" || parent.kind() === "source_file"
           || parent.kind() === "translation_unit" || parent.kind() === "module"
           || parent.kind() === "export_statement" || parent.kind() === "decorated_definition"
           || parent.kind() === "compilation_unit"
           // Depth 2: e.g., class inside namespace
           || (grandparent && (grandparent.kind() === "program" || grandparent.kind() === "source_file"
-            || grandparent.kind() === "translation_unit" || grandparent.kind() === "compilation_unit"));
+            || grandparent.kind() === "translation_unit" || grandparent.kind() === "compilation_unit"
+            || grandparent.kind() === "source"));
 
         if (isTopLevel) {
           regions.push({ startLine: range.start.line, endLine: range.end.line + 1 });
@@ -336,25 +522,113 @@ function findAstBoundaries(source: string, lang: Lang | string): AstRegion[] {
 }
 
 /**
- * Apply a hard character cap to every chunk as a universal safety net.
- * Any chunk whose content exceeds MAX_CHUNK_CHARS is truncated. This is
- * intentionally simple — the provider's pre-truncation is the last-resort
+ * Enforce the per-chunk character cap on every chunking strategy.
+ *
+ * On a collection indexed as format 2 the cap is a split boundary: a chunk
+ * longer than it becomes as many chunks as it needs, and nothing but
+ * whitespace-only pieces is dropped. A collection stored below that keeps
+ * truncating, so its stored representation stays what its profile says.
+ *
+ * Truncation was the behaviour everywhere. Chunks are cut by line count
+ * (CHUNK_SIZE) while the cap counts characters, so a window of CHUNK_SIZE lines
+ * overflows as soon as its lines average more than
+ * MAX_CHUNK_CHARS / CHUNK_SIZE characters — which ordinary source and prose
+ * both do — and everything past the cap reached neither the vector, nor the
+ * payload, nor the BM25 text. No search could retrieve it.
+ *
+ * The provider's pre-truncation still stands behind this as the last-resort
  * defence; this cap ensures chunks are already within bounds before that.
  */
-function applyCharCap(chunks: FileChunk[]): FileChunk[] {
-  if (chunks.every((c) => c.content.length <= MAX_CHUNK_CHARS)) return chunks;
-  return chunks.map((c) =>
-    c.content.length > MAX_CHUNK_CHARS
-      ? { ...c, content: c.content.substring(0, MAX_CHUNK_CHARS) }
-      : c,
-  );
+function splitToCharCap(
+  chunks: FileChunk[],
+  maxChunkChars: number = MAX_CHUNK_CHARS,
+  indexFormatVersion: number = CURRENT_INDEX_FORMAT_VERSION,
+): FileChunk[] {
+  // A collection keeps the representation it was created with. Splitting is the
+  // format-2 representation; a collection stored as format 0 or 1 must keep
+  // truncating, for files that changed and for files discovered after the
+  // upgrade alike, so that what is written never drifts from what its persisted
+  // effective profile says.
+  if (indexFormatVersion < SPLITTING_INDEX_FORMAT_VERSION) {
+    return chunks
+      .map((c) =>
+        c.content.length > maxChunkChars
+          ? { ...c, content: c.content.substring(0, maxChunkChars) }
+          : c,
+      )
+      .filter((c) => c.content.trim().length > 0);
+  }
+  // Terminal invariant: never emit a chunk with no non-whitespace content.
+  // Four of the five `return` paths in chunkFileContent pass through here (the
+  // fifth returns []), so this is the one place that can guarantee the property
+  // for every chunking strategy — including zero-byte and whitespace-only files,
+  // which reach chunkByLines and would otherwise yield a single blank chunk.
+  // Safe to drop: chunk ids are derived from the chunk's own position, so
+  // removing a chunk never renumbers any other.
+  //
+  // ORDER MATTERS: split first, then filter. A chunk can be all whitespace up to
+  // the cap and hold its only real content past it; filtering first would keep
+  // the piece that turns out blank and drop nothing, so the invariant would not
+  // actually hold on the returned chunks.
+  const split =
+    chunks.every((c) => c.content.length <= maxChunkChars)
+      ? chunks
+      : chunks.flatMap((c) =>
+          c.content.length > maxChunkChars
+            ? splitOversizedChunk(c, maxChunkChars)
+            : [c],
+        );
+  return split.filter((c) => c.content.trim().length > 0);
+}
+
+/**
+ * Split one over-long chunk into cap-sized pieces.
+ *
+ * Ordinary source and prose use the newline-first boundary rule. Minified code
+ * has a separate token-safe rule in `chunkByCharacters`; routing this path
+ * through that chunker would make ordinary chunks change representation too.
+ * The ids and line numbers here are rebased onto the parent, so the pieces stay
+ * addressable and keep pointing at the lines they came from.
+ */
+function splitOversizedChunk(chunk: FileChunk, maxChunkChars: number): FileChunk[] {
+  // Only reachable for format 2: splitToCharCap returns before this for a
+  // collection stored below it.
+  const pieces = splitTextToCharCap(chunk.content, maxChunkChars);
+  return pieces.map((piece, index) => ({
+    ...chunk,
+    content: piece.text,
+    // The first piece inherits the parent's identity — same id, same startLine —
+    // so a chunk that needed no splitting and one that did agree on where they
+    // begin. Continuations are seeded from the parent id (see continuationId).
+    id: index === 0 ? chunk.id : continuationId(chunk.id, index),
+    // split helper counts lines from 1 within the slice it was given; the
+    // parent's own startLine puts them back on the file's line numbering. This
+    // also re-derives the parent's endLine, which truncation used to leave
+    // claiming lines the chunk no longer held.
+    startLine: chunk.startLine + piece.startLine - 1,
+    // The parent's last piece ends where the parent ended. Deriving it from the
+    // piece instead would come up a line short whenever the parent's final line
+    // is blank: the text then ends on a newline, and a trailing newline closes
+    // the last line rather than opening another. Together the pieces cover the
+    // parent exactly, so the last one has to reach its end.
+    endLine:
+      index === pieces.length - 1 ? chunk.endLine : chunk.startLine + piece.endLine - 1,
+    type: chunk.type,
+  }));
 }
 
 /**
  * Character-based chunking for minified/bundled content whose average line
- * length exceeds MAX_AVG_LINE_LENGTH. Splits at safe token boundaries
- * (newline, space, tab, semicolon, comma) so chunks stay within
- * MAX_CHUNK_CHARS without splitting mid-identifier.
+ * length exceeds MAX_AVG_LINE_LENGTH, so that chunks stay within
+ * MAX_CHUNK_CHARS.
+ *
+ * Where the boundary falls depends on the collection's stored format, because
+ * a collection keeps the representation it was created with. Format 0 and 1
+ * run the released scan, which accepts a newline, space, tab, semicolon or
+ * comma near the end of the window and so usually avoids splitting
+ * mid-identifier. Format 2 preserves that boundary set, but bounds the scan
+ * inside the cap and corrects line-ending and Unicode-pair handling — see
+ * splitTextToCharCap.
  *
  * NOTE: The chunk `id` uses the byte offset as its discriminator (not the
  * line number) because minified files may consist of a single very long
@@ -365,13 +639,57 @@ function chunkByCharacters(
   relativePath: string,
   content: string,
   language: string,
+  maxChunkChars: number,
+  indexFormatVersion: number,
+): FileChunk[] {
+  // Format 0 and 1 keep the released algorithm exactly — boundaries, offsets
+  // and ids alike. This path already produces chunks within the cap, so the
+  // gate in splitToCharCap runs too late to restore them; the choice has to be
+  // made here.
+  if (indexFormatVersion < SPLITTING_INDEX_FORMAT_VERSION) {
+    return chunkByCharactersLegacy(filePath, relativePath, content, language, maxChunkChars);
+  }
+
+  let offset = 0;
+  return splitTextToCharCap(content, maxChunkChars, "code-token").map((piece) => {
+    const chunk: FileChunk = {
+      id: chunkId(relativePath, offset), // byte offset → unique ID even for 1-line files
+      filePath,
+      relativePath,
+      content: piece.text,
+      startLine: piece.startLine,
+      endLine: piece.endLine,
+      language,
+      type: "code",
+    };
+    offset += piece.text.length;
+    return chunk;
+  });
+}
+
+/**
+ * The released character-based chunker, kept verbatim for collections stored as
+ * format 0 or 1.
+ *
+ * Its boundary set (newline, space, tab, semicolon, comma) and its scan that
+ * starts at the limit itself decide where every chunk begins, and the chunk id
+ * is seeded from that byte offset. Reproducing the bytes is therefore not
+ * enough: anything but this exact loop gives such a collection different ids
+ * and different line ranges on the next incremental update.
+ */
+function chunkByCharactersLegacy(
+  filePath: string,
+  relativePath: string,
+  content: string,
+  language: string,
+  maxChunkChars: number,
 ): FileChunk[] {
   const chunks: FileChunk[] = [];
   let offset = 0;
   let currentLine = 1;
 
   while (offset < content.length) {
-    let end = Math.min(offset + MAX_CHUNK_CHARS, content.length);
+    let end = Math.min(offset + maxChunkChars, content.length);
 
     // Scan backwards from the hard limit to find a safe split boundary.
     // If none is found within the window, fall through and split at the limit.
@@ -421,10 +739,33 @@ export function chunkFileContent(
   filePath: string,
   relativePath: string,
   content: string,
+  options: {
+    maxChunkChars?: number;
+    extensionLanguageMap?: Map<string, string>;
+    indexFormatVersion?: number;
+  } = {},
 ): FileChunk[] {
+  const maxChunkChars = options.maxChunkChars ?? MAX_CHUNK_CHARS;
+  const extensionLanguageMap = options.extensionLanguageMap ?? EXTENSION_LANGUAGE_MAP;
+  const indexFormatVersion = options.indexFormatVersion ?? CURRENT_INDEX_FORMAT_VERSION;
   const lines = content.split("\n");
-  const ext = path.extname(filePath).toLowerCase();
-  const language = getLanguageFromExtension(ext);
+  let ext = path.extname(filePath).toLowerCase();
+  // Extensionless files (not SPECIAL_FILES) inherit their language/grammar from
+  // content detection, gated by the same kill-switch as discovery so the two
+  // stay consistent. The on-disk path is never rewritten — only the
+  // language/grammar selection changes.
+  if (ext === "" && indexExtensionlessEnabled() && !SPECIAL_FILES.has(path.basename(filePath))) {
+    // Scores the same byte window as discovery's readFileHead, via the one
+    // helper that owns that rule, so chunking and discovery cannot disagree
+    // about the same bytes.
+    const detected = detectExtensionFromSource(content);
+    // If the content changed since discovery admitted this file (TOCTOU) and it
+    // no longer detects as code, produce no chunks rather than indexing it as
+    // plaintext — keeping chunking consistent with getIndexableFiles' contract.
+    if (!detected) return [];
+    ext = detected;
+  }
+  const language = getLanguageFromExtension(ext, extensionLanguageMap);
 
   // Detect minified/bundled content before any other branching: a high
   // average line length means line-based chunks would be huge single lines
@@ -435,12 +776,16 @@ export function chunkFileContent(
       relativePath,
       avgLineLength: Math.round(avgLineLength),
     });
-    return applyCharCap(chunkByCharacters(filePath, relativePath, content, language));
+    return splitToCharCap(
+      chunkByCharacters(filePath, relativePath, content, language, maxChunkChars, indexFormatVersion),
+      maxChunkChars,
+      indexFormatVersion,
+    );
   }
 
   // Small files: single chunk regardless of language
   if (lines.length <= CHUNK_SIZE) {
-    return applyCharCap([{
+    return splitToCharCap([{
       id: chunkId(relativePath, 1),
       filePath,
       relativePath,
@@ -449,19 +794,29 @@ export function chunkFileContent(
       endLine: lines.length,
       language,
       type: "code",
-    }]);
+    }], maxChunkChars, indexFormatVersion);
   }
 
-  // Try AST-aware chunking for supported languages
-  const astLang = getAstGrepLang(ext);
-  const regions = astLang ? findAstBoundaries(content, astLang) : [];
+  // Try AST-aware chunking for supported languages and mixed Elixir templates.
+  const astLang = getAstGrepLang(ext, extensionLanguageMap);
+  const regions = isElixirTemplateExtension(ext)
+    ? (analyzeElixirTemplate(content, ext)?.regions ?? [])
+    : astLang ? findAstBoundaries(content, astLang) : [];
 
   if (regions.length > 0) {
-    return applyCharCap(chunkByAstRegions(filePath, relativePath, lines, language, regions));
+    return splitToCharCap(
+      chunkByAstRegions(filePath, relativePath, lines, language, regions),
+      maxChunkChars,
+      indexFormatVersion,
+    );
   }
 
   // Fallback: line-based chunking
-  return applyCharCap(chunkByLines(filePath, relativePath, lines, language));
+  return splitToCharCap(
+    chunkByLines(filePath, relativePath, lines, language),
+    maxChunkChars,
+    indexFormatVersion,
+  );
 }
 
 /**
@@ -480,7 +835,7 @@ function chunkByAstRegions(
   // Preamble: everything before the first declaration (imports, constants, comments)
   if (regions[0].startLine > 0) {
     const preambleLines = lines.slice(0, regions[0].startLine);
-    if (preambleLines.length > 0) {
+    if (preambleLines.some((line) => line.length > 0)) {
       chunks.push({
         id: chunkId(relativePath, 1),
         filePath,
@@ -566,7 +921,7 @@ function chunkByAstRegions(
   const lastEnd = regions[regions.length - 1].endLine;
   if (lastEnd < lines.length) {
     const epilogueLines = lines.slice(lastEnd);
-    if (epilogueLines.length > 0) {
+    if (epilogueLines.some((line) => line.length > 0)) {
       chunks.push({
         id: chunkId(relativePath, lastEnd + 1),
         filePath,
@@ -619,6 +974,7 @@ function chunkByLines(
 export async function getIndexableFiles(
   projectPath: string,
   extraExts?: Set<string>,
+  extensionLanguageMap: Map<string, string> = EXTENSION_LANGUAGE_MAP,
 ): Promise<string[]> {
   const ig = createIgnoreFilter(projectPath);
 
@@ -629,12 +985,49 @@ export async function getIndexableFiles(
     absolute: false,
   });
 
-  return allFiles.filter((relativePath) => {
+  const kept: string[] = [];
+  const extensionlessCandidates: string[] = [];
+  const detectionEnabled = indexExtensionlessEnabled();
+
+  for (const relativePath of allFiles) {
+    if (shouldIgnore(ig, relativePath)) continue;
     const fileName = path.basename(relativePath);
-    if (!isIndexableFile(fileName, extraExts)) return false;
-    if (shouldIgnore(ig, relativePath)) return false;
-    return true;
-  });
+    if (isIndexableFile(fileName, extraExts, extensionLanguageMap)) {
+      kept.push(relativePath);
+      continue;
+    }
+    // Extensionless survivors (detection never runs on a file with an
+    // extension, and SPECIAL_FILES were already admitted above).
+    if (detectionEnabled && path.extname(fileName) === "") {
+      extensionlessCandidates.push(relativePath);
+    }
+  }
+
+  // Batched head-read + content detection for extensionless candidates.
+  for (let i = 0; i < extensionlessCandidates.length; i += FILE_SCAN_BATCH) {
+    const batch = extensionlessCandidates.slice(i, i + FILE_SCAN_BATCH);
+    const detected = await Promise.all(
+      batch.map(async (relativePath) => {
+        const ext = await resolveExtensionlessExtension(path.join(projectPath, relativePath));
+        return ext ? relativePath : null;
+      }),
+    );
+    for (const r of detected) if (r) kept.push(r);
+  }
+
+  return kept;
+}
+
+/** Why an index must not start, or null; an uninspectable barrier is a reason too. */
+async function reclamationRefusal(resolvedPath: string): Promise<string | null> {
+  try {
+    await assertNoReclamationBarrier(projectIdFromPath(resolvedPath));
+    return null;
+  } catch (err) {
+    const msg = `Refusing to index: ${err instanceof Error ? err.message : String(err)}`;
+    logger.info(msg, { projectPath: resolvedPath });
+    return msg;
+  }
 }
 
 /** Full index of a project directory */
@@ -648,15 +1041,40 @@ export async function indexProject(
 
   const resolvedPath = path.resolve(projectPath);
 
-  // Cross-process lock: prevent two MCP instances from indexing the same project
-  const lockAcquired = await acquireProjectLock(resolvedPath, "index");
+  const reclaimed = await reclamationRefusal(resolvedPath);
+  if (reclaimed) {
+    onProgress?.(reclaimed);
+    return { filesIndexed: 0, chunksCreated: 0, cancelled: false };
+  }
+
+  // Cross-process lock, taken non-reentrantly: a lock this process already
+  // holds belongs to another run or to reclamation, never to this call.
+  const lockAcquired = await acquireProjectLock(
+    resolvedPath,
+    "index",
+    () => cancelBecauseLockWasLost(resolvedPath),
+    { reentrant: false },
+  );
   if (!lockAcquired) {
     const msg = "Another process is already indexing this project, skipping";
     logger.info(msg, { projectPath: resolvedPath });
     onProgress?.(msg);
     return { filesIndexed: 0, chunksCreated: 0, cancelled: false };
   }
+  try {
+    return await indexProjectLocked(resolvedPath, onProgress, extraExtensions);
+  } finally {
+    await releaseProjectLock(resolvedPath, "index");
+  }
+}
 
+/** The full index, under an index lock the caller holds and releases. */
+async function indexProjectLocked(
+  projectPath: string,
+  onProgress?: (message: string) => void,
+  extraExtensions?: Set<string>,
+): Promise<{ filesIndexed: number; chunksCreated: number; cancelled: boolean }> {
+  const resolvedPath = path.resolve(projectPath);
   const progress: IndexingProgress = {
     type: "full-index",
     startedAt: Date.now(),
@@ -674,7 +1092,7 @@ export async function indexProject(
   // Smart re-index: check if collection already has data.
   // getCollectionInfo now throws on transient errors (instead of returning null),
   // so a Qdrant blip will abort the operation rather than trigger a false clean-start.
-  let existingInfo: { pointsCount: number; status: string } | null;
+  let existingInfo: CollectionInfo | null;
   try {
     existingInfo = await getCollectionInfo(collection);
   } catch (err) {
@@ -687,10 +1105,43 @@ export async function indexProject(
   }
   const hasExistingData = existingInfo !== null && existingInfo.pointsCount > 0;
 
+  // Resuming from `in-progress` is the one state where hashes are known to
+  // outlive the chunks they describe, so it is the one state that pays for the
+  // reconciliation scroll. See reconcileHashesWithStoredPoints for why this is
+  // scoped rather than run on every index.
+  if (hasExistingData) {
+    // Strict read on purpose: getProjectMetadata() answers null for any failure,
+    // so using it here would turn a transient metadata error into "not
+    // interrupted", skip the recovery that error should have triggered, and let
+    // the run persist a still-damaged index as completed. A failed read must
+    // abort instead.
+    const persisted = await loadIndexingStatus(collection);
+    if (persisted === "in-progress") {
+      await reconcileHashesWithStoredPoints(collection, hashes, projectId);
+    }
+  }
+
+  const storedProfile = existingInfo === null
+    ? null
+    : await loadProjectEffectiveProfile(collection);
+  const effectiveProfile = resolveEffectiveIndexProfile(
+    "code",
+    storedProfile,
+    hasExistingData,
+    existingInfo?.denseVectorSize,
+  );
+  const effectiveExtensionMap = profileExtensionLanguageMap(effectiveProfile);
+  const effectiveMaxFileBytes = effectiveProfile.maxFileBytes;
+  if (effectiveMaxFileBytes === undefined) {
+    throw new Error(`Code index profile for ${collection} has no maxFileBytes value.`);
+  }
+  const effectiveDocumentText = documentTextProfile(effectiveProfile);
+  await ensureEffectiveEmbeddingReady(effectiveProfile, onProgress);
+
   // ensureCollection is idempotent — creates if absent, no-op if exists.
   // IMPORTANT: We NEVER delete a collection here. Only removeProjectIndex
   // (called by the codebase_remove tool) is allowed to delete collections.
-  await ensureCollection(collection);
+  await withEffectiveEmbedding(effectiveProfile, () => ensureCollection(collection));
 
   if (hasExistingData) {
     if (hashes.size > 0) {
@@ -713,9 +1164,28 @@ export async function indexProject(
     hashes.clear();
   }
 
+  // Persist the profile before the first vector write. A crash between an
+  // upsert and the first batch checkpoint must not leave unprofiled new points.
+  await saveProjectMetadata(
+    collection,
+    resolvedPath,
+    0,
+    hashes.size,
+    hashes,
+    "in-progress",
+    effectiveProfile,
+  );
+
   // ── Phase 1: Scan and chunk files ──
   progress.phase = "scanning files";
-  const files = await getIndexableFiles(resolvedPath, extraExtensions);
+  const files = await getIndexableFiles(
+    resolvedPath,
+    extraExtensions,
+    effectiveExtensionMap,
+  );
+  if (files.some((file) => isElixirTemplateExtension(path.extname(file)))) {
+    await ensureElixirTemplateParsers();
+  }
   progress.filesTotal = files.length;
   onProgress?.(`Found ${files.length} indexable files`);
 
@@ -727,6 +1197,7 @@ export async function indexProject(
   }
 
   const chunkedFiles: ChunkedFile[] = [];
+  const oversizedFiles = new Set<string>();
   let skippedCount = 0;
 
   for (let i = 0; i < files.length; i += FILE_SCAN_BATCH) {
@@ -736,8 +1207,9 @@ export async function indexProject(
         const absolutePath = path.join(resolvedPath, relativePath);
         try {
           const stat = await fsp.stat(absolutePath);
-          if (stat.size > MAX_FILE_BYTES) {
+          if (stat.size > effectiveMaxFileBytes) {
             onProgress?.(`Skipping large file (${(stat.size / 1024 / 1024).toFixed(1)}MB): ${relativePath}`);
+            oversizedFiles.add(relativePath);
             return null;
           }
           const content = await fsp.readFile(absolutePath, "utf-8");
@@ -748,7 +1220,11 @@ export async function indexProject(
             return null;
           }
 
-          const chunks = chunkFileContent(absolutePath, relativePath, content);
+          const chunks = chunkFileContent(absolutePath, relativePath, content, {
+            maxChunkChars: effectiveProfile.maxChunkChars,
+            extensionLanguageMap: effectiveExtensionMap,
+            indexFormatVersion: effectiveProfile.indexFormatVersion,
+          });
           return { relativePath, absolutePath, contentHash, chunks };
         } catch {
           return null;
@@ -775,7 +1251,9 @@ export async function indexProject(
     }
 
     // Handle deleted files
-    const currentFileSet = new Set(files);
+    const currentFileSet = new Set(
+      files.filter((relativePath) => !oversizedFiles.has(relativePath)),
+    );
     for (const [filePath] of hashes) {
       if (!currentFileSet.has(filePath)) {
         await deleteFileChunks(collection, filePath);
@@ -827,7 +1305,21 @@ export async function indexProject(
     }
 
     if (batchChunkData.length === 0) {
+      for (const file of fileBatch) {
+        hashes.set(file.relativePath, file.contentHash);
+      }
+      progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;
+      await saveProjectMetadata(
+        collection,
+        resolvedPath,
+        files.length,
+        hashes.size,
+        hashes,
+        "in-progress",
+        effectiveProfile,
+      );
       progress.batchesProcessed = batchNum;
+      onProgress?.(`Batch ${batchNum}/${totalBatches} checkpointed (${totalChunksCreated} chunks so far)`);
       continue;
     }
 
@@ -835,10 +1327,14 @@ export async function indexProject(
     progress.phase = `generating embeddings (batch ${batchNum}/${totalBatches})`;
     onProgress?.(`Batch ${batchNum}/${totalBatches}: generating embeddings for ${batchChunkData.length} chunks (${fileBatch.length} files)...`);
 
-    const batchTexts = batchChunkData.map((c) => prepareDocumentText(c.chunk.content, c.chunk.relativePath));
-    const batchEmbeddings = await generateEmbeddings(batchTexts, (processed) => {
-      progress.chunksProcessed = globalChunksProcessed + processed;
-    });
+    const batchTexts = batchChunkData.map((c) =>
+      prepareDocumentText(c.chunk.content, c.chunk.relativePath, effectiveDocumentText),
+    );
+    const batchEmbeddings = await withEffectiveEmbedding(effectiveProfile, () =>
+      generateEmbeddings(batchTexts, (processed) => {
+        progress.chunksProcessed = globalChunksProcessed + processed;
+      }),
+    );
     globalChunksProcessed += batchChunkData.length;
 
     // Upsert this batch to Qdrant
@@ -859,7 +1355,9 @@ export async function indexProject(
       },
     }));
 
-    const { pointsSkipped } = await upsertPreEmbeddedChunks(collection, batchPoints).catch((err) => {
+    // Throws if any point failed after the per-point fallback, so hashes below
+    // are only advanced for a batch that landed in full.
+    await upsertPreEmbeddedChunks(collection, batchPoints).catch((err) => {
       // Enrich the error with batch context for debugging
       const fileList = fileBatch.map((f) => f.relativePath).join(", ");
       const msg = err instanceof Error ? err.message : String(err);
@@ -870,14 +1368,6 @@ export async function indexProject(
       );
     });
 
-    if (pointsSkipped > 0 && pointsSkipped === batchPoints.length) {
-      // Every single point in the batch was skipped — the collection likely disappeared
-      throw new Error(
-        `Qdrant upsert: all ${batchPoints.length} points in batch ${batchNum}/${totalBatches} ` +
-        `were skipped (collection=${collection}). The collection may have been deleted externally.`
-      );
-    }
-
     // Update hashes for this batch's files
     for (const file of fileBatch) {
       hashes.set(file.relativePath, file.contentHash);
@@ -886,23 +1376,112 @@ export async function indexProject(
 
     // Checkpoint: persist hashes after each batch so progress survives crashes
     progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;
-    await saveProjectMetadata(collection, resolvedPath, files.length, hashes.size, hashes, "in-progress");
+    await saveProjectMetadata(
+      collection,
+      resolvedPath,
+      files.length,
+      hashes.size,
+      hashes,
+      "in-progress",
+      effectiveProfile,
+    );
     progress.batchesProcessed = batchNum;
     onProgress?.(`Batch ${batchNum}/${totalBatches} checkpointed (${totalChunksCreated} chunks so far)`);
   }
 
-  const filesIndexed = files.length;
+  // filesTotal is everything the walk found; filesIndexed is what the index
+  // actually represents. They differ whenever a file was skipped before
+  // chunking — oversized, or unreadable — so the walked count would overstate
+  // the result. hashes.size is authoritative: oversized paths are excluded from
+  // currentFileSet above and pruned from hashes, and unreadable files never get
+  // an entry. Reaching here means every batch landed in full, since a partial
+  // upsert throws, so no stale entry can inflate it either.
+  const filesTotal = files.length;
+  const filesIndexed = hashes.size;
   const chunksCreated = totalChunksCreated;
+
+  // The batch loop's check cannot see a cancellation that arrives during the
+  // final batch, and a run with no batches never reaches it at all. Either way
+  // the flag would be set and never read, and this transition would then tell
+  // the next run the collection is healthy — suppressing the reconciliation
+  // that repairs it. The checkpoints above already persisted `in-progress`, so
+  // returning here leaves the collection recoverable.
+  if (isCancellationRequested(resolvedPath)) {
+    onProgress?.(`Indexing cancelled before completion (${chunksCreated} chunks saved). Progress is preserved — re-run codebase_index to resume.`);
+    logger.info("Indexing cancelled before the completed transition", { projectPath: resolvedPath, chunksIndexed: chunksCreated });
+    lastCompleted.set(resolvedPath, {
+      type: "full-index",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { filesIndexed: progress.filesProcessed, chunksCreated, cancelled: true };
+  }
 
   // Final metadata save
   progress.phase = "saving metadata";
-  await saveProjectMetadata(collection, resolvedPath, filesIndexed, hashes.size, hashes, "completed");
+  const completedStands = await persistCompletedUnlessLockLost(
+    collection,
+    resolvedPath,
+    filesTotal,
+    filesIndexed,
+    hashes,
+    effectiveProfile,
+  );
+  if (!completedStands) {
+    onProgress?.(`Indexing cancelled while completing (${chunksCreated} chunks saved). Progress is preserved — re-run codebase_index to resume.`);
+    lastCompleted.set(resolvedPath, {
+      type: "full-index",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { filesIndexed: progress.filesProcessed, chunksCreated, cancelled: true };
+  }
+
+  // Post-terminal phases are long, asynchronous, and write to collections the
+  // reconciliation does not cover — the code graph, the symbol graph and the
+  // context artifacts. A lock lost during any of them leaves this process
+  // writing to a project it no longer owns, and previously the run carried on
+  // through every remaining phase and then reported success. Check between
+  // phases and stop instead.
+  const stopIfCancelled = (): {
+    filesIndexed: number;
+    chunksCreated: number;
+    cancelled: boolean;
+  } | null => {
+    if (!isCancellationRequested(resolvedPath)) return null;
+    onProgress?.(`Indexing cancelled during ${progress.phase} (${chunksCreated} chunks saved). The index itself is written; re-run codebase_index to finish the remaining work.`);
+    logger.info("Indexing cancelled during post-index work", {
+      projectPath: resolvedPath,
+      phase: progress.phase,
+    });
+    lastCompleted.set(resolvedPath, {
+      type: "full-index",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: filesIndexed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { filesIndexed, chunksCreated, cancelled: true };
+  };
+
+  let postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
 
   // Auto-build code graph
   progress.phase = "building code graph";
   onProgress?.("Building code dependency graph...");
   try {
-    const graph = await rebuildGraph(resolvedPath);
+    // The same extra extensions the index was built with: a graph built under
+    // the defaults would drop every leaf node they admit, and the record would
+    // then disagree with the next decision about which set was in force.
+    const graph = await rebuildGraph(resolvedPath, extraExtensions);
     onProgress?.(`Code graph built: ${graph.nodes.length} files, ${graph.edges.length} edges`);
   } catch (graphErr) {
     const graphMsg = graphErr instanceof Error ? graphErr.message : String(graphErr);
@@ -910,9 +1489,19 @@ export async function indexProject(
     onProgress?.(`Code graph build failed (non-fatal): ${graphMsg}`);
   }
 
+  postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
+
   // Auto-index context artifacts if .socraticodecontextartifacts.json exists
   try {
     const artifactConfig = await loadConfig(resolvedPath);
+    // Ownership can be lost while loadConfig is pending, and this run would
+    // then start a fresh write to the context collection for a project it no
+    // longer owns. The gate before this phase cannot see that, so check again
+    // once the await has resolved and before anything is written.
+    postIndexCancelled = stopIfCancelled();
+    if (postIndexCancelled) return postIndexCancelled;
+
     if (artifactConfig?.artifacts?.length) {
       progress.phase = "indexing context artifacts";
       onProgress?.(`Indexing ${artifactConfig.artifacts.length} context artifact${artifactConfig.artifacts.length === 1 ? "" : "s"}...`);
@@ -928,6 +1517,9 @@ export async function indexProject(
     logger.warn("Context artifact indexing failed (non-fatal)", { projectPath: resolvedPath, error: artifactMsg });
     onProgress?.(`Context artifact indexing failed (non-fatal): ${artifactMsg}`);
   }
+
+  postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
 
   onProgress?.(`Indexing complete: ${filesIndexed} files, ${chunksCreated} chunks`);
   lastCompleted.set(resolvedPath, {
@@ -953,7 +1545,6 @@ export async function indexProject(
   } finally {
     indexingInProgress.delete(resolvedPath);
     cancellationRequested.delete(resolvedPath);
-    await releaseProjectLock(resolvedPath, "index");
   }
 }
 
@@ -967,8 +1558,20 @@ export async function updateProjectIndex(
 
   const resolvedPath = path.resolve(projectPath);
 
-  // Cross-process lock: prevent two MCP instances from updating the same project
-  const lockAcquired = await acquireProjectLock(resolvedPath, "index");
+  const reclaimed = await reclamationRefusal(resolvedPath);
+  if (reclaimed) {
+    onProgress?.(reclaimed);
+    return { added: 0, updated: 0, removed: 0, chunksCreated: 0, cancelled: false };
+  }
+
+  // Cross-process lock, taken non-reentrantly; the full-index fallback below
+  // runs under this same lock through the private locked path.
+  const lockAcquired = await acquireProjectLock(
+    resolvedPath,
+    "index",
+    () => cancelBecauseLockWasLost(resolvedPath),
+    { reentrant: false },
+  );
   if (!lockAcquired) {
     const msg = "Another process is already indexing this project, skipping";
     logger.info(msg, { projectPath: resolvedPath });
@@ -992,7 +1595,7 @@ export async function updateProjectIndex(
 
   // Ensure collection exists — getCollectionInfo now throws on transient errors,
   // so a network blip will abort rather than cascade into a destructive fallback.
-  let info: { pointsCount: number; status: string } | null;
+  let info: CollectionInfo | null;
   try {
     info = await getCollectionInfo(collection);
   } catch (err) {
@@ -1007,8 +1610,20 @@ export async function updateProjectIndex(
   if (!info || info.pointsCount === 0) {
     // Collection truly doesn't exist or is empty — safe to do a full index
     onProgress?.("No existing index found, performing full index...");
-    const result = await indexProject(projectPath, onProgress, extraExtensions);
+    const result = await indexProjectLocked(resolvedPath, onProgress, extraExtensions);
     return { added: result.filesIndexed, updated: 0, removed: 0, chunksCreated: result.chunksCreated, cancelled: result.cancelled };
+  }
+
+  // Same reconciliation as indexProject, and needed here for the same reason:
+  // an incremental is what usually runs after an interruption, so this is the
+  // path that would otherwise trust a hash whose chunks are gone and skip the
+  // file forever. Scoped to `in-progress` — see reconcileHashesWithStoredPoints.
+  {
+    // Strict read — see the note at the matching gate in indexProject.
+    const persisted = await loadIndexingStatus(collection);
+    if (persisted === "in-progress") {
+      await reconcileHashesWithStoredPoints(collection, hashes, projectId);
+    }
   }
 
   if (hashes.size === 0) {
@@ -1020,16 +1635,47 @@ export async function updateProjectIndex(
       collection,
       pointsCount: info.pointsCount,
     });
-    const result = await indexProject(projectPath, onProgress, extraExtensions);
+    const result = await indexProjectLocked(resolvedPath, onProgress, extraExtensions);
     return { added: result.filesIndexed, updated: 0, removed: 0, chunksCreated: result.chunksCreated, cancelled: result.cancelled };
   }
 
+  const storedProfile = await loadProjectEffectiveProfile(collection);
+  const effectiveProfile = resolveEffectiveIndexProfile(
+    "code",
+    storedProfile,
+    true,
+    info.denseVectorSize,
+  );
+  const effectiveExtensionMap = profileExtensionLanguageMap(effectiveProfile);
+  const effectiveMaxFileBytes = effectiveProfile.maxFileBytes;
+  if (effectiveMaxFileBytes === undefined) {
+    throw new Error(`Code index profile for ${collection} has no maxFileBytes value.`);
+  }
+  const effectiveDocumentText = documentTextProfile(effectiveProfile);
+  await ensureEffectiveEmbeddingReady(effectiveProfile, onProgress);
+
+  await saveProjectMetadata(
+    collection,
+    resolvedPath,
+    0,
+    hashes.size,
+    hashes,
+    "in-progress",
+    effectiveProfile,
+  );
+
   // ── Phase 1: Scan files and identify changes ──
   progress.phase = "scanning for changes";
-  const currentFiles = await getIndexableFiles(resolvedPath, extraExtensions);
+  const currentFiles = await getIndexableFiles(
+    resolvedPath,
+    extraExtensions,
+    effectiveExtensionMap,
+  );
+  if (currentFiles.some((file) => isElixirTemplateExtension(path.extname(file)))) {
+    await ensureElixirTemplateParsers();
+  }
   progress.filesTotal = currentFiles.length;
   onProgress?.(`Found ${currentFiles.length} indexable files, scanning for changes...`);
-  const currentFileSet = new Set(currentFiles);
 
   interface ChangedFile {
     relativePath: string;
@@ -1040,27 +1686,44 @@ export async function updateProjectIndex(
   }
 
   const changedFiles: ChangedFile[] = [];
+  const oversizedFiles = new Set<string>();
+  // Files this run tried to read and could not. The index keeps whatever hash
+  // it already held for them, so nothing downstream can tell they went unread —
+  // except the code graph's rebuild gate, which would otherwise take that
+  // stale hash as proof the file is unchanged while a rebuild would drop it.
+  const unreadableFiles = new Set<string>();
 
   for (let i = 0; i < currentFiles.length; i += FILE_SCAN_BATCH) {
     const batch = currentFiles.slice(i, i + FILE_SCAN_BATCH);
     const results = await Promise.all(
       batch.map(async (relativePath): Promise<ChangedFile | null> => {
         const absolutePath = path.join(resolvedPath, relativePath);
+        let read = false;
         try {
           const stat = await fsp.stat(absolutePath);
-          if (stat.size > MAX_FILE_BYTES) {
+          if (stat.size > effectiveMaxFileBytes) {
             onProgress?.(`Skipping large file (${(stat.size / 1024 / 1024).toFixed(1)}MB): ${relativePath}`);
+            oversizedFiles.add(relativePath);
             return null;
           }
           const content = await fsp.readFile(absolutePath, "utf-8");
+          read = true;
           const contentHash = hashContent(content);
           const existingHash = hashes.get(relativePath);
 
           if (existingHash === contentHash) return null;
 
-          const chunks = chunkFileContent(absolutePath, relativePath, content);
+          const chunks = chunkFileContent(absolutePath, relativePath, content, {
+            maxChunkChars: effectiveProfile.maxChunkChars,
+            extensionLanguageMap: effectiveExtensionMap,
+            indexFormatVersion: effectiveProfile.indexFormatVersion,
+          });
           return { relativePath, absolutePath, contentHash, chunks, isNew: !existingHash };
         } catch {
+          // Only a stat or read that failed counts: a file that was read and
+          // then failed to chunk is not unreadable, and marking it so would
+          // rebuild the graph on every run for as long as it stayed that way.
+          if (!read) unreadableFiles.add(relativePath);
           return null;
         }
       }),
@@ -1072,6 +1735,9 @@ export async function updateProjectIndex(
 
   const unchangedCount = currentFiles.length - changedFiles.length;
   onProgress?.(`${changedFiles.length} files changed, ${unchangedCount} unchanged/skipped`);
+  const currentFileSet = new Set(
+    currentFiles.filter((relativePath) => !oversizedFiles.has(relativePath)),
+  );
 
   let added = 0;
   let updated = 0;
@@ -1128,7 +1794,23 @@ export async function updateProjectIndex(
       }
 
       if (batchChunkData.length === 0) {
+        for (const file of fileBatch) {
+          hashes.set(file.relativePath, file.contentHash);
+          if (file.isNew) added++;
+          else updated++;
+        }
+        progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;
+        await saveProjectMetadata(
+          collection,
+          resolvedPath,
+          currentFiles.length,
+          hashes.size,
+          hashes,
+          "in-progress",
+          effectiveProfile,
+        );
         progress.batchesProcessed = batchNum;
+        onProgress?.(`Batch ${batchNum}/${totalBatches} checkpointed (${chunksCreated} chunks so far)`);
         continue;
       }
 
@@ -1136,10 +1818,14 @@ export async function updateProjectIndex(
       progress.phase = `generating embeddings (batch ${batchNum}/${totalBatches})`;
       onProgress?.(`Batch ${batchNum}/${totalBatches}: generating embeddings for ${batchChunkData.length} chunks (${fileBatch.length} files changed)...`);
 
-      const batchTexts = batchChunkData.map((c) => prepareDocumentText(c.chunk.content, c.chunk.relativePath));
-      const batchEmbeddings = await generateEmbeddings(batchTexts, (processed) => {
-        progress.chunksProcessed = globalChunksProcessed + processed;
-      });
+      const batchTexts = batchChunkData.map((c) =>
+        prepareDocumentText(c.chunk.content, c.chunk.relativePath, effectiveDocumentText),
+      );
+      const batchEmbeddings = await withEffectiveEmbedding(effectiveProfile, () =>
+        generateEmbeddings(batchTexts, (processed) => {
+          progress.chunksProcessed = globalChunksProcessed + processed;
+        }),
+      );
       globalChunksProcessed += batchChunkData.length;
 
       // Upsert this batch to Qdrant
@@ -1160,14 +1846,9 @@ export async function updateProjectIndex(
         },
       }));
 
-      const { pointsSkipped } = await upsertPreEmbeddedChunks(collection, batchPoints);
-
-      if (pointsSkipped > 0 && pointsSkipped === batchPoints.length) {
-        throw new Error(
-          `Qdrant upsert: all ${batchPoints.length} points in batch ${batchNum}/${totalBatches} ` +
-          `were skipped (collection=${collection}). The collection may have been deleted externally.`
-        );
-      }
+      // Throws if any point failed after the per-point fallback, so hashes below
+      // are only advanced for a batch that landed in full.
+      await upsertPreEmbeddedChunks(collection, batchPoints);
 
       // Update hashes and counts for this batch's files
       for (const file of fileBatch) {
@@ -1179,7 +1860,15 @@ export async function updateProjectIndex(
 
       // Checkpoint: persist hashes after each batch
       progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;
-      await saveProjectMetadata(collection, resolvedPath, currentFiles.length, hashes.size, hashes, "in-progress");
+      await saveProjectMetadata(
+        collection,
+        resolvedPath,
+        currentFiles.length,
+        hashes.size,
+        hashes,
+        "in-progress",
+        effectiveProfile,
+      );
       progress.batchesProcessed = batchNum;
       onProgress?.(`Batch ${batchNum}/${totalBatches} checkpointed (${chunksCreated} chunks so far)`);
     }
@@ -1197,62 +1886,143 @@ export async function updateProjectIndex(
     }
   }
 
-  // Persist updated hashes
-  await saveProjectMetadata(collection, resolvedPath, currentFiles.length, hashes.size, hashes, "completed");
+  // Same terminal gate as the full index, and it matters more here: the removal
+  // loop above deletes chunks, and the batch loop is skipped entirely when
+  // nothing changed, so a cancellation can arrive with no later check to read
+  // it. Persisting `completed` over a half-removed collection is precisely the
+  // state the reconciliation on resume exists to repair.
+  if (isCancellationRequested(resolvedPath)) {
+    onProgress?.(`Update cancelled before completion (${chunksCreated} chunks saved). Progress is preserved — re-run codebase_update to resume.`);
+    logger.info("Incremental update cancelled before the completed transition", { projectPath: resolvedPath, chunksCreated });
+    lastCompleted.set(resolvedPath, {
+      type: "incremental-update",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { added, updated, removed, chunksCreated, cancelled: true };
+  }
 
-  // Auto-rebuild code graph if any files changed (Phase F).
+  // Persist updated hashes
+  const completedStands = await persistCompletedUnlessLockLost(
+    collection,
+    resolvedPath,
+    currentFiles.length,
+    hashes.size,
+    hashes,
+    effectiveProfile,
+  );
+  if (!completedStands) {
+    onProgress?.(`Update cancelled while completing (${chunksCreated} chunks saved). Progress is preserved — re-run codebase_update to resume.`);
+    lastCompleted.set(resolvedPath, {
+      type: "incremental-update",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { added, updated, removed, chunksCreated, cancelled: true };
+  }
+
+  // Same post-terminal guard as the full index: the graph, symbol-graph and
+  // context collections are written here, none of them covered by the
+  // reconciliation, so a lock lost during one of these phases must stop the run
+  // rather than carry it through to a success result.
+  const stopIfCancelled = (): {
+    added: number;
+    updated: number;
+    removed: number;
+    chunksCreated: number;
+    cancelled: boolean;
+  } | null => {
+    if (!isCancellationRequested(resolvedPath)) return null;
+    onProgress?.(`Update cancelled during ${progress.phase} (${chunksCreated} chunks saved). The index itself is written; re-run codebase_update to finish the remaining work.`);
+    logger.info("Incremental update cancelled during post-index work", {
+      projectPath: resolvedPath,
+      phase: progress.phase,
+    });
+    lastCompleted.set(resolvedPath, {
+      type: "incremental-update",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { added, updated, removed, chunksCreated, cancelled: true };
+  };
+
+  let postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
+
+  // Auto-rebuild code graph if any graph input changed (Phase F).
   //
-  // Strategy:
-  //   - If a symbol-graph already exists AND the change set is small
-  //     (≤ INCREMENTAL_SYMBOL_THRESHOLD files), do a fast file-import-graph
-  //     rebuild then patch the symbol graph per-file via
-  //     `updateChangedFilesSymbolGraph`.
-  //   - Otherwise fall back to a full `rebuildGraph()` that also rebuilds
-  //     the symbol graph end-to-end.
-  if (added > 0 || updated > 0 || removed > 0) {
-    progress.phase = "building code graph";
-    const projectId = projectIdFromPath(resolvedPath);
+  // While every changed or removed file requires a complete symbol-graph rebuild,
+  // bypass the incremental branch and perform one complete graph rebuild.
+  //
+  // Not every change is one the graph is built from, though. A commit touching
+  // only a README, a fixture, a migration or a manifest the resolver never
+  // reads produces the graph that already exists, and pays the whole rebuild
+  // for it — roughly 7ms per file, so 27s on a large repository, per commit.
+  // `shouldRebuildGraph` answers from the record the last build left of what
+  // it read, and says so only when the change is proven to touch none of it.
+  //
+  // The question is asked whether or not the index itself moved, because the
+  // two sets are not the same: `go.mod`, `project.godot`, a `.uid` sidecar and
+  // (unless INCLUDE_DOT_FILES is set) every ignore file shape the graph while
+  // being indexed by nothing, so a commit touching only one of those has every
+  // counter at zero and still leaves the graph wrong. Gated on a record having
+  // been found: without one there is nothing to argue from, so a project that
+  // has never been built under this scheme keeps the old trigger and the first
+  // update that changes anything is what rebuilds and writes the record.
+  const indexChanged = added > 0 || updated > 0 || removed > 0;
+  {
     const totalChanged = changedFiles.length + removedRelPaths.length;
-    const meta = await loadSymbolGraphMeta(projectId).catch(() => null);
-    const useIncremental = meta !== null && totalChanged <= INCREMENTAL_SYMBOL_THRESHOLD;
 
     try {
-      onProgress?.(
-        useIncremental
-          ? `Building file graph + incrementally updating ${totalChanged} symbol payload(s)...`
-          : "Building code dependency graph (full rebuild)...",
+      // `hashes` has already been brought up to date above — changed files
+      // carry their new hash and removed ones are gone — so it answers "what
+      // is in this file now" for everything the index holds, and the graph's
+      // recorded inputs are compared against it without reading anything
+      // twice. Inputs the index does not hold are read by the decision itself.
+      const decision = await shouldRebuildGraph(
+        resolvedPath,
+        {
+          hasAdditions: changedFiles.some((file) => file.isNew),
+          changed: new Map(changedFiles.map((file) => [file.relativePath, file.contentHash])),
+          removed: new Set(removedRelPaths),
+          unreadable: unreadableFiles,
+          knownHash: (relativePath) => hashes.get(relativePath),
+        },
+        extraExtensions,
       );
-      const graph = await rebuildGraph(resolvedPath, { skipSymbolGraph: useIncremental });
-      onProgress?.(`Code graph built: ${graph.nodes.length} files, ${graph.edges.length} edges`);
 
-      if (useIncremental) {
-        try {
-          const result = await updateChangedFilesSymbolGraph(
-            projectId,
-            resolvedPath,
-            graph,
-            changedFiles.map((f) => f.relativePath),
-            removedRelPaths,
-          );
-          if (result.fullRebuildRequired) {
-            // Meta vanished between checks — fall back to a full symbol rebuild.
-            onProgress?.("Symbol graph meta missing — falling back to full rebuild");
-            await rebuildGraph(resolvedPath, { skipSymbolGraph: false });
-          } else {
-            onProgress?.(
-              `Symbol graph patched: +${result.symbolsDelta} symbols, ` +
-                `+${result.edgesDelta} edges (${result.filesChanged} changed, ${result.filesRemoved} removed)`,
-            );
-          }
-        } catch (incErr) {
-          // Last-resort fallback: full rebuild. Never let watcher fail.
-          const incMsg = incErr instanceof Error ? incErr.message : String(incErr);
-          logger.warn("Incremental symbol-graph update failed; falling back to full rebuild", {
+      if (!decision.rebuild || !(indexChanged || decision.graphExists)) {
+        if (indexChanged) {
+          logger.info("Code graph rebuild skipped: the change touched no graph input", {
             projectPath: resolvedPath,
-            error: incMsg,
+            filesChanged: totalChanged,
           });
-          await rebuildGraph(resolvedPath, { skipSymbolGraph: false });
+          onProgress?.(
+            `Code graph unchanged (${totalChanged} file(s) changed, none of them a graph input)`,
+          );
         }
+      } else {
+        progress.phase = "building code graph";
+        logger.info("Rebuilding code graph", { projectPath: resolvedPath, reason: decision.reason });
+        onProgress?.(
+          totalChanged > 0
+            ? `Building code dependency graph (${totalChanged} file(s) changed, full rebuild)...`
+            : `Building code dependency graph (${decision.reason})...`,
+        );
+        const graph = await rebuildGraph(resolvedPath, {
+          skipSymbolGraph: false,
+          extraExtensions,
+        });
+        onProgress?.(`Code graph built: ${graph.nodes.length} files, ${graph.edges.length} edges`);
       }
     } catch (graphErr) {
       const graphMsg = graphErr instanceof Error ? graphErr.message : String(graphErr);
@@ -1261,9 +2031,19 @@ export async function updateProjectIndex(
     }
   }
 
+  postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
+
   // Auto-index context artifacts if changed (non-fatal)
   try {
     const artifactConfig = await loadConfig(resolvedPath);
+    // Ownership can be lost while loadConfig is pending, and this run would
+    // then start a fresh write to the context collection for a project it no
+    // longer owns. The gate before this phase cannot see that, so check again
+    // once the await has resolved and before anything is written.
+    postIndexCancelled = stopIfCancelled();
+    if (postIndexCancelled) return postIndexCancelled;
+
     if (artifactConfig?.artifacts?.length) {
       progress.phase = "indexing context artifacts";
       const result = await ensureArtifactsIndexed(resolvedPath);
@@ -1276,7 +2056,11 @@ export async function updateProjectIndex(
     logger.warn("Context artifact indexing failed during incremental update (non-fatal)", { projectPath: resolvedPath, error: artifactMsg });
   }
 
+  postIndexCancelled = stopIfCancelled();
+  if (postIndexCancelled) return postIndexCancelled;
+
   onProgress?.(`Update complete: ${added} added, ${updated} updated, ${removed} removed`);
+
   lastCompleted.set(resolvedPath, {
     type: "incremental-update",
     completedAt: Date.now(),
@@ -1315,6 +2099,11 @@ export async function removeProjectIndex(projectPath: string): Promise<void> {
   await removeGraph(resolvedPath);
   // Also remove context artifacts (if any)
   await removeAllArtifacts(resolvedPath);
+  invalidateProjectHashesForIdentity(projectId);
+}
+
+/** Forget the loaded file hashes of an identity whose collection is gone. */
+export function invalidateProjectHashesForIdentity(projectId: string): void {
   projectHashes.delete(projectId);
   projectHashesLoaded.delete(projectId);
 }

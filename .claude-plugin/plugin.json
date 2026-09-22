@@ -1,6 +1,6 @@
 {
   "name": "socraticode",
-  "version": "1.7.2",
+  "version": "1.14.0",
   "description": "Codebase intelligence — semantic search workflows, dependency graph analysis, and context artifact exploration for SocratiCode",
   "author": {
     "name": "Giancarlo Erra",
@@ -18,5 +18,5 @@
     "semantic-search",
     "mcp"
   ],
-  "mcpServers": "./.mcp.json"
+  "mcpServers": "./.claude-plugin/mcp.json"
 }

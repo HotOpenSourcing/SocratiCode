@@ -13,7 +13,7 @@ Start indexing a codebase in the background. Returns immediately.
 
 **Key behaviours:**
 - Runs asynchronously — does NOT block. Returns immediately.
-- Auto-starts file watcher upon completion (if not cancelled)
+- Auto-starts file watcher upon completion (if not cancelled and `SOCRATICODE_WATCHER=auto`)
 - Ensures Docker/Qdrant/Ollama infrastructure is running first
 - Concurrency guard: if already indexing, returns current progress instead of starting again
 - Auto-indexes context artifacts defined in `.socraticodecontextartifacts.json`
@@ -36,7 +36,7 @@ Incrementally update an existing index. Only re-indexes changed files.
 **Key behaviours:**
 - Runs synchronously (blocking), unlike `codebase_index`
 - Only processes files changed since last index (via content hash comparison)
-- Auto-starts file watcher if not already active
+- Auto-starts file watcher if not already active and `SOCRATICODE_WATCHER=auto`
 - Usually not needed if the file watcher is running
 
 ---
@@ -57,6 +57,33 @@ Remove a project's entire index from the vector database.
 - Cancels in-progress indexing and drains current batch
 - Waits for in-flight graph builds to finish before deletion
 - May refuse if indexing batch can't drain within 5 minutes (retry after)
+
+---
+
+## codebase_prune
+
+Inventory every stored project identity, and delete one only on an explicit, confirmed apply.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `apply` | boolean | no | `false` | Delete the selected identity. Omit for the report. |
+| `identity` | string | with `apply` | — | Exact identity as printed by the report |
+| `confirmationToken` | string | with `apply` | — | Token printed beside that identity in a fresh report |
+| `acknowledgeNoRemoteWriters` | boolean | with `apply` | — | States that no other host sharing this Qdrant is writing to the identity |
+
+**Returns:** The report lists, per identity, the recorded path and its state (`present-on-this-host`, `absent-on-this-host`, `unknown/inaccessible`), the collections carrying its name, every metadata record with point id, status, timestamps and builder version, advisories (`possible-superseded`, manual inspection), and the confirmation token. Metadata points that cannot be attributed to an identity are listed with the reason, and so are collections whose name fits two identities and nothing in the store settles which. An apply returns one line per resource (`deleted` or `failed` with the error) and, when anything is still stored afterwards, what remains.
+
+**Key behaviours:**
+- **Report-only by default**; no candidate set is derived from path state, and there is no blanket apply
+- Path absence on this host is an observation, not proof of abandonment (shared stores)
+- The token covers every collection and every metadata record; any change refuses the apply
+- Refused while the identity is indexed, watched, graph-built or context-indexed here, while another local process holds any of its `index`/`watch`/`graph`/`context` locks, when a lock cannot be inspected, when a record reports indexing in progress, or when a barrier lock is lost before the delete
+- Holds an identity-scoped barrier (`prune` plus every writer lock) from final validation through deletion; every writer checks it before starting and holds its own lock while it runs, so graph builds and context indexing of one identity no longer run in two processes at once
+- Targets the inventoried identity directly, so a stranded pinned id is reachable
+- Every identity an unsettled name could belong to is held back from deletion until a person settles it
+- Barrier ownership is re-checked before every write; a barrier lost mid-cleanup stops deletion and reports incomplete
+- Already-gone resources count as deleted: repeating an apply is safe
+- Success only when a re-read inventory shows nothing left for the identity
 
 ---
 
@@ -95,8 +122,9 @@ Start/stop/status of live file watching.
 - `stop`: Stops same-process watcher (cross-process watchers unaffected)
 - `status`: Lists all watched projects including cross-process watchers
 - Detects if another process already watches the same project
-- Auto-started after successful `codebase_index` or `codebase_update`
-- Debounced with ~500ms delay to batch rapid file changes
+- Auto-started after successful `codebase_index` or `codebase_update` in `auto` mode
+- `manual` suppresses automatic starts but permits `start`; `off` rejects `start` before catch-up or infrastructure work
+- Debounced with 2s delay to batch rapid file changes
 
 ---
 
@@ -233,14 +261,15 @@ List all projects that have been indexed.
 - Stale locks from crashed processes are auto-reclaimed
 
 ### Auto-features
-- File watcher auto-starts after indexing/updates
+- File watcher auto-starts after indexing/updates in `SOCRATICODE_WATCHER=auto`
 - Context artifacts auto-indexed on first `codebase_context_search`
 - Stale artifacts auto-detected and re-indexed
 - Code graph auto-built after indexing
-- Session resume: watcher restarts on first tool use for previously indexed projects
+- Session resume: watcher restarts on first tool use for previously indexed projects in `auto`
+- Snapshot mode: `SOCRATICODE_WATCHER=off` plus `SOCRATICODE_AUTO_RESUME=off` leaves existing code indexes and graphs readable but performs no implicit code-index update, embedding, or graph creation
 
 ### Supported file extensions
-**Built-in:** `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs`, `.py`, `.pyw`, `.pyi`, `.java`, `.kt`, `.kts`, `.scala`, `.c`, `.h`, `.cpp`, `.hpp`, `.cc`, `.hh`, `.cxx`, `.cs`, `.go`, `.rs`, `.rb`, `.php`, `.swift`, `.sh`, `.bash`, `.zsh`, `.html`, `.htm`, `.css`, `.scss`, `.sass`, `.less`, `.vue`, `.svelte`, `.json`, `.yaml`, `.yml`, `.toml`, `.xml`, `.ini`, `.cfg`, `.md`, `.mdx`, `.rst`, `.txt`, `.sql`, `.dart`, `.lua`, `.r`, `.R`, `.dockerfile`
+**Built-in:** `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs`, `.py`, `.pyw`, `.pyi`, `.java`, `.kt`, `.kts`, `.scala`, `.c`, `.h`, `.cpp`, `.hpp`, `.cc`, `.hh`, `.cxx`, `.cs`, `.go`, `.rs`, `.rb`, `.php`, `.swift`, `.sh`, `.bash`, `.zsh`, `.html`, `.htm`, `.css`, `.scss`, `.sass`, `.less`, `.styl`, `.vue`, `.svelte`, `.json`, `.yaml`, `.yml`, `.toml`, `.xml`, `.ini`, `.cfg`, `.md`, `.mdx`, `.rst`, `.txt`, `.sql`, `.dart`, `.lua`, `.r`, `.R`, `.dockerfile`
 
 **Special files:** `Dockerfile`, `Makefile`, `Rakefile`, `Gemfile`, `Procfile`, `.env.example`, `.gitignore`, `.dockerignore`
 
@@ -249,5 +278,5 @@ List all projects that have been indexed.
 ### Chunking defaults
 - Chunk size: 100 lines, 10 lines overlap
 - Batch size: 50 files per batch (for resumable checkpointing)
-- Max chunk chars: 2000 (safety limit)
-- Max file size: 5 MB (configurable via `MAX_FILE_SIZE_MB`)
+- Max chunk chars: 2000 (configurable via `MAX_CHUNK_CHARS`; on a format-2 collection a chunk over the cap is split at the last newline at or before it, while minified code also uses space, tab, semicolon and comma boundaries to avoid splitting identifiers where possible. A boundary may move by one UTF-16 code unit to preserve a surrogate pair or CRLF. Nothing is dropped except a piece holding only whitespace. A collection indexed before format 2 keeps truncating)
+- Max file size: 5 MB (configurable via `MAX_FILE_SIZE_MB`; must be a complete finite number)

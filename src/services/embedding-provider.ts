@@ -8,9 +8,11 @@
  * about which backend generates the vectors.
  *
  * Providers:
- *   - ollama  (default) — local Ollama (Docker or external)
- *   - openai  — OpenAI Embeddings API (text-embedding-3-small, etc.)
- *   - google  — Google Generative AI Embedding API (gemini-embedding-001, etc.)
+ *   - ollama   (default) — local Ollama (Docker or external)
+ *   - openai   — OpenAI Embeddings API (text-embedding-3-small, etc.)
+ *   - google   — Google Generative AI Embedding API (gemini-embedding-001, etc.)
+ *   - lmstudio — local LM Studio server via OpenAI-compatible API
+ *   - litellm  — LiteLLM proxy (OpenAI-compatible gateway in front of 100+ providers)
  */
 
 import type { InfraProgressCallback } from "./docker.js";
@@ -60,9 +62,19 @@ export async function getEmbeddingProvider(onProgress?: InfraProgressCallback): 
       _provider = new GoogleEmbeddingProvider();
       break;
     }
+    case "lmstudio": {
+      const { LMStudioEmbeddingProvider } = await import("./provider-lmstudio.js");
+      _provider = new LMStudioEmbeddingProvider();
+      break;
+    }
+    case "litellm": {
+      const { LiteLLMEmbeddingProvider } = await import("./provider-litellm.js");
+      _provider = new LiteLLMEmbeddingProvider();
+      break;
+    }
     default:
       throw new Error(
-        `Unknown embedding provider: "${name}". Must be "ollama", "openai", or "google".`,
+        `Unknown embedding provider: "${name}". Must be "ollama", "openai", "google", "lmstudio", or "litellm".`,
       );
   }
 

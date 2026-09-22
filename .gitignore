@@ -7,14 +7,11 @@ dist/
 Thumbs.db
 
 # IDE / editor
-.vscode
 .idea
 *.swp
 *.swo
 
 # Environment & secrets
-.env
-.env.*
 !.env.example
 
 # Coverage & logs
@@ -38,3 +35,4 @@ coverage/
 # Personal instructions (Copilot)
 .github/copilot-instructions.md
 .github/instructions/
+config.bat

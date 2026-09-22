@@ -2,10 +2,15 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import { describe, expect, it } from "vitest";
 import {
+  describeGraphBuilder,
+  describeUnresolvedSymbolEdges,
   findCircularDependencies,
   generateMermaidDiagram,
   getFileDependencies,
   getGraphStats,
+  isGraphBuilderStale,
+  isImportResolutionLow,
+  LOW_IMPORT_RESOLUTION_MIN_IMPORTS,
 } from "../../src/services/graph-analysis.js";
 import type { CodeGraph, CodeGraphEdge, CodeGraphNode } from "../../src/types.js";
 
@@ -112,6 +117,58 @@ describe("graph-analysis", () => {
 
       expect(deps.imports).toHaveLength(0);
       expect(deps.importedBy).toHaveLength(0);
+    });
+
+    it("normalizes Windows backslash paths to match forward-slash graph keys", () => {
+      const graph = createSampleGraph();
+      // Graph keys use forward slashes; simulate a Windows-style query
+      const deps = getFileDependencies(graph, "src\\index.ts");
+
+      expect(deps.imports).toContain("src/utils.ts");
+      expect(deps.imports).toContain("src/types.ts");
+    });
+
+    it("normalizes deeply nested Windows paths", () => {
+      const nodes: CodeGraphNode[] = [
+        makeNode("src/services/graph/analysis.ts", ["src/types.ts"], []),
+        makeNode("src/types.ts", [], ["src/services/graph/analysis.ts"]),
+      ];
+      const edges: CodeGraphEdge[] = [
+        makeEdge("src/services/graph/analysis.ts", "src/types.ts"),
+      ];
+      const graph = makeGraph(nodes, edges);
+
+      const deps = getFileDependencies(graph, "src\\services\\graph\\analysis.ts");
+      expect(deps.imports).toContain("src/types.ts");
+    });
+
+    it("handles mixed separator paths", () => {
+      const graph = createSampleGraph();
+      const deps = getFileDependencies(graph, "src/utils.ts");
+      const depsMixed = getFileDependencies(graph, "src\\utils.ts");
+
+      expect(depsMixed.imports).toEqual(deps.imports);
+      expect(depsMixed.importedBy).toEqual(deps.importedBy);
+    });
+
+    it("finds nodes in a legacy cached graph with backslash keys", () => {
+      // Simulate a graph built on Windows before the fix: stored keys have backslashes
+      const nodes: CodeGraphNode[] = [
+        makeNode("src\\services\\api.ts", ["src\\types.ts"], []),
+        makeNode("src\\types.ts", [], ["src\\services\\api.ts"]),
+      ];
+      // Fix relativePath (makeNode sets it from the argument)
+      nodes[0].relativePath = "src\\services\\api.ts";
+      nodes[1].relativePath = "src\\types.ts";
+
+      const edges: CodeGraphEdge[] = [
+        makeEdge("src\\services\\api.ts", "src\\types.ts"),
+      ];
+      const graph = makeGraph(nodes, edges);
+
+      // Query with forward slashes should still find the node
+      const deps = getFileDependencies(graph, "src/services/api.ts");
+      expect(deps.imports).toContain("src\\types.ts");
     });
   });
 
@@ -301,6 +358,184 @@ describe("graph-analysis", () => {
       const graph = makeGraph(nodes, []);
       const mermaid = generateMermaidDiagram(graph);
       expect(mermaid).toContain("subgraph Legend");
+    });
+  });
+
+  // ── Import-resolution yield (#107) ───────────────────────────────────
+
+  describe("isImportResolutionLow", () => {
+    // codebase_graph_status reports READY on graph existence alone, so a
+    // resolver failure and a healthy graph are indistinguishable downstream.
+    // These pin the measurement that tells them apart.
+
+    it("flags a graph that resolved almost none of its captured imports", () => {
+      // Measured on the issue #107 repo before the fix: 35 of 2,959 (1.2%).
+      expect(isImportResolutionLow(35, 2959)).toBe(true);
+    });
+
+    it("stays quiet on the same repo once the resolver handles its layout", () => {
+      // The same repo after the fix: 2,103 of 2,959 (71%).
+      expect(isImportResolutionLow(2103, 2959)).toBe(false);
+    });
+
+    it("stays quiet on a project whose imports are mostly external", () => {
+      // Measured on a doc-heavy repo: 23 of 304 (7.6%). Few in-tree imports
+      // and many external ones is a healthy shape, not a resolver failure.
+      expect(isImportResolutionLow(23, 304)).toBe(false);
+    });
+
+    it("stays quiet just above the ratio and fires just below it", () => {
+      // Boundary either side of 2%, at an import count well over the floor.
+      expect(isImportResolutionLow(21, 1000)).toBe(false);
+      expect(isImportResolutionLow(19, 1000)).toBe(true);
+    });
+
+    it("treats a ratio exactly at the threshold as acceptable", () => {
+      expect(isImportResolutionLow(20, 1000)).toBe(false);
+    });
+
+    it("says nothing about a project with too few imports to judge", () => {
+      // A five-file utility repo importing only `os` and `json` resolves zero
+      // and is correct; the ratio carries no signal at this size.
+      expect(isImportResolutionLow(0, LOW_IMPORT_RESOLUTION_MIN_IMPORTS - 1)).toBe(false);
+      expect(isImportResolutionLow(0, 0)).toBe(false);
+    });
+
+    it("judges a project once it reaches the import floor", () => {
+      expect(isImportResolutionLow(0, LOW_IMPORT_RESOLUTION_MIN_IMPORTS)).toBe(true);
+    });
+
+    it("says nothing when the count is absent on an older persisted graph", () => {
+      // importCount post-dates existing graphs; those print nothing until the
+      // next rebuild rather than being guessed at.
+      expect(isImportResolutionLow(0, undefined)).toBe(false);
+    });
+  });
+
+  describe("isGraphBuilderStale", () => {
+    it("flags a graph built by an earlier release", () => {
+      // The issue #120 case: a graph cut by v1.10.0 and served by v1.12.0,
+      // four days and one shipped resolver apart, with every visible signal
+      // reporting the server rather than the artifact.
+      expect(isGraphBuilderStale("1.10.0", "1.12.0")).toBe(true);
+      expect(isGraphBuilderStale("1.12.0", "1.12.1")).toBe(true);
+      expect(isGraphBuilderStale("0.9.9", "1.0.0")).toBe(true);
+    });
+
+    it("does not flag a matching or newer builder", () => {
+      expect(isGraphBuilderStale("1.12.0", "1.12.0")).toBe(false);
+      // A downgrade: unusual, but the graph is not missing anything the
+      // running build has.
+      expect(isGraphBuilderStale("1.13.0", "1.12.0")).toBe(false);
+    });
+
+    it("compares segments numerically, not as text", () => {
+      expect(isGraphBuilderStale("1.9.0", "1.10.0")).toBe(true);
+      expect(isGraphBuilderStale("1.10.0", "1.9.0")).toBe(false);
+    });
+
+    it("treats absent segments as zero", () => {
+      expect(isGraphBuilderStale("1.12", "1.12.1")).toBe(true);
+      expect(isGraphBuilderStale("1.12", "1.12.0")).toBe(false);
+    });
+
+    it("says nothing when the stamp is absent on an older persisted graph", () => {
+      // Unknown is not stale. The caller says so in its own words and points
+      // at a rebuild, rather than claiming a version it does not have.
+      expect(isGraphBuilderStale(undefined, "1.12.0")).toBe(false);
+      expect(isGraphBuilderStale("", "1.12.0")).toBe(false);
+    });
+
+    it("says nothing when either version does not read as a release", () => {
+      expect(isGraphBuilderStale("dev", "1.12.0")).toBe(false);
+      expect(isGraphBuilderStale("1.12.0", "unknown")).toBe(false);
+      expect(isGraphBuilderStale("1.2.3.4.5", "1.12.0")).toBe(false);
+    });
+
+    it("orders a prerelease before the release it leads to", () => {
+      // SemVer precedence, spec item 11: the beta predates whatever landed in
+      // the run-up to the release, so a graph it built is behind that release.
+      expect(isGraphBuilderStale("1.13.0-beta.1", "1.13.0")).toBe(true);
+      // And the converse: a released graph is not behind a prerelease server.
+      expect(isGraphBuilderStale("1.13.0", "1.13.0-beta.1")).toBe(false);
+      expect(isGraphBuilderStale("1.13.0-beta.1", "1.13.0-beta.1")).toBe(false);
+    });
+
+    it("orders prerelease identifiers by SemVer precedence", () => {
+      // Alphanumeric identifiers compare in ASCII order...
+      expect(isGraphBuilderStale("1.13.0-alpha", "1.13.0-beta")).toBe(true);
+      expect(isGraphBuilderStale("1.13.0-beta", "1.13.0-alpha")).toBe(false);
+      // ...numeric ones numerically, so 2 is behind 10 rather than ahead of it
+      // as a string comparison would have it...
+      expect(isGraphBuilderStale("1.13.0-alpha.2", "1.13.0-alpha.10")).toBe(true);
+      // ...a numeric identifier is always lower than an alphanumeric one...
+      expect(isGraphBuilderStale("1.13.0-1", "1.13.0-alpha")).toBe(true);
+      // ...and a longer identifier list outranks the prefix it extends.
+      expect(isGraphBuilderStale("1.13.0-alpha", "1.13.0-alpha.1")).toBe(true);
+    });
+
+    it("ignores build metadata, which carries no precedence", () => {
+      expect(isGraphBuilderStale("v1.11.0", "1.12.0+build.7")).toBe(true);
+      expect(isGraphBuilderStale("1.13.0+a", "1.13.0+b")).toBe(false);
+      expect(isGraphBuilderStale("1.13.0-beta.1+a", "1.13.0")).toBe(true);
+    });
+
+    it("says nothing when a prerelease identifier is not one SemVer allows", () => {
+      // Refusing to rank a string this does not understand keeps a wrong
+      // verdict off the screen; unknown is reported instead.
+      expect(isGraphBuilderStale("1.13.0-beta_1", "1.13.0")).toBe(false);
+      expect(isGraphBuilderStale("1.13.0-", "1.13.0")).toBe(false);
+    });
+  });
+
+  describe("describeGraphBuilder", () => {
+    it("states the builder and nothing more when it matches the server", () => {
+      expect(describeGraphBuilder("1.12.0", "1.12.0")).toEqual(["Built by: v1.12.0"]);
+    });
+
+    it("names both versions and points at a rebuild when the graph is behind", () => {
+      const lines = describeGraphBuilder("1.10.0", "1.12.0");
+      expect(lines[0]).toContain("Built by: v1.10.0");
+      expect(lines[0]).toContain("STALE");
+      expect(lines[0]).toContain("this server is v1.12.0");
+      expect(lines[1]).toContain("codebase_graph_build");
+    });
+
+    it("says unknown, not stale, for a graph persisted before the stamp existed", () => {
+      // The exact case the stamp was added for: claiming a version here would
+      // be inventing one. Saying it is unrecorded, and that a rebuild settles
+      // it, is the whole of what is known.
+      const lines = describeGraphBuilder(undefined, "1.12.0");
+      expect(lines[0]).toContain("unknown");
+      expect(lines[0]).not.toContain("STALE");
+      expect(lines[1]).toContain("codebase_graph_build");
+    });
+  });
+
+  // ── Unresolved call share (#172) ─────────────────────────────────────
+
+  describe("describeUnresolvedSymbolEdges", () => {
+    // The number is the persisted unresolvedEdgePct, unchanged; what these pin
+    // is that the output says what it is a share of and what that share includes.
+
+    it("keeps the one-decimal number and says what it is a share of", () => {
+      const lines = describeUnresolvedSymbolEdges(57.5);
+      expect(lines[0]).toBe("  Unresolved: 57.5% of captured symbol edges did not match a project symbol");
+    });
+
+    it("names every edge kind counted, and runtime builtins and external libraries as part of the share", () => {
+      const [, explanation] = describeUnresolvedSymbolEdges(57.5);
+      expect(explanation).toContain("calls, imports, re-exports and type or value references");
+      expect(explanation).toContain("runtime builtins");
+      expect(explanation).toContain("external libraries");
+      expect(explanation).toContain("only GDScript engine calls are left out");
+      expect(explanation).toContain("not a resolver failure rate");
+    });
+
+    it("renders a fully resolved graph with the same shape", () => {
+      const lines = describeUnresolvedSymbolEdges(0);
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toContain("Unresolved: 0.0% of captured symbol edges");
     });
   });
 });

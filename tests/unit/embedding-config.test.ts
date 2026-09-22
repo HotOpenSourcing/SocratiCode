@@ -20,8 +20,18 @@ describe("embedding-config", () => {
     delete process.env.EMBEDDING_DIMENSIONS;
     delete process.env.EMBEDDING_CONTEXT_LENGTH;
     delete process.env.OLLAMA_API_KEY;
+    delete process.env.OLLAMA_MAX_CONNECTIONS;
     delete process.env.OPENAI_API_KEY;
     delete process.env.GOOGLE_API_KEY;
+    delete process.env.LMSTUDIO_URL;
+    delete process.env.LMSTUDIO_API_KEY;
+    delete process.env.LMSTUDIO_ALLOW_MISSING_MODEL_LISTING;
+    delete process.env.LITELLM_URL;
+    delete process.env.LITELLM_API_KEY;
+    delete process.env.LITELLM_SEND_DIMENSIONS;
+    delete process.env.EMBEDDING_QUERY_PREFIX;
+    delete process.env.EMBEDDING_DOCUMENT_PREFIX;
+    delete process.env.EMBEDDING_DOCUMENT_INCLUDE_PATH;
   });
 
   afterEach(() => {
@@ -137,6 +147,29 @@ describe("embedding-config", () => {
     });
   });
 
+  describe("OLLAMA_MAX_CONNECTIONS", () => {
+    it("defaults to 4", () => {
+      expect(loadEmbeddingConfig().ollamaMaxConnections).toBe(4);
+    });
+
+    it("honours a custom positive integer", () => {
+      process.env.OLLAMA_MAX_CONNECTIONS = "8";
+      expect(loadEmbeddingConfig().ollamaMaxConnections).toBe(8);
+    });
+
+    it("throws for a non-integer or non-positive value", () => {
+      // A silently-clamped bad value would hide a config typo behind a
+      // working pool of the wrong size; the loader must refuse instead.
+      for (const bad of ["0", "-2", "four", "2.5"]) {
+        resetEmbeddingConfig();
+        process.env.OLLAMA_MAX_CONNECTIONS = bad;
+        expect(() => loadEmbeddingConfig(), bad).toThrow(
+          `Invalid OLLAMA_MAX_CONNECTIONS: "${bad}". Must be a positive integer.`,
+        );
+      }
+    });
+  });
+
   describe("singleton behavior", () => {
     it("caches config after first load", () => {
       const first = loadEmbeddingConfig();
@@ -178,10 +211,15 @@ describe("embedding-config", () => {
         embeddingProvider: "ollama",
         ollamaMode: "external",
         ollamaUrl: "http://remote-gpu:11434",
+        lmstudioUrl: "http://localhost:1234/v1",
+        litellmUrl: "http://localhost:4000/v1",
+        allowMissingModelListing: false,
         embeddingModel: "mxbai-embed-large",
         embeddingDimensions: 1024,
         embeddingContextLength: 512,
+        litellmSendDimensions: false,
         ollamaApiKey: "secret",
+        ollamaMaxConnections: 4,
       });
     });
   });
@@ -215,7 +253,7 @@ describe("embedding-config", () => {
     it("throws for invalid EMBEDDING_PROVIDER", () => {
       process.env.EMBEDDING_PROVIDER = "anthropic";
       expect(() => loadEmbeddingConfig()).toThrow(
-        'Invalid EMBEDDING_PROVIDER: "anthropic". Must be "ollama", "openai", or "google".',
+        'Invalid EMBEDDING_PROVIDER: "anthropic". Must be "ollama", "openai", "google", "lmstudio", or "litellm".',
       );
     });
 
@@ -246,6 +284,255 @@ describe("embedding-config", () => {
       process.env.EMBEDDING_CONTEXT_LENGTH = "4096";
       const config = loadEmbeddingConfig();
       expect(config.embeddingContextLength).toBe(4096);
+    });
+  });
+
+  describe("lmstudio provider", () => {
+    it("loads when EMBEDDING_MODEL and EMBEDDING_DIMENSIONS are set", () => {
+      process.env.EMBEDDING_PROVIDER = "lmstudio";
+      process.env.EMBEDDING_MODEL = "nomic-embed-text-v1.5";
+      process.env.EMBEDDING_DIMENSIONS = "768";
+
+      const config = loadEmbeddingConfig();
+      expect(config.embeddingProvider).toBe("lmstudio");
+      expect(config.embeddingModel).toBe("nomic-embed-text-v1.5");
+      expect(config.embeddingDimensions).toBe(768);
+    });
+
+    it("defaults LMSTUDIO_URL to http://localhost:1234/v1", () => {
+      process.env.EMBEDDING_PROVIDER = "lmstudio";
+      process.env.EMBEDDING_MODEL = "nomic-embed-text-v1.5";
+      process.env.EMBEDDING_DIMENSIONS = "768";
+
+      const config = loadEmbeddingConfig();
+      expect(config.lmstudioUrl).toBe("http://localhost:1234/v1");
+    });
+
+    it("respects LMSTUDIO_URL override", () => {
+      process.env.EMBEDDING_PROVIDER = "lmstudio";
+      process.env.EMBEDDING_MODEL = "nomic-embed-text-v1.5";
+      process.env.EMBEDDING_DIMENSIONS = "768";
+      process.env.LMSTUDIO_URL = "http://gpu-rig.local:5678/v1";
+
+      const config = loadEmbeddingConfig();
+      expect(config.lmstudioUrl).toBe("http://gpu-rig.local:5678/v1");
+    });
+
+    it("throws when EMBEDDING_MODEL is missing", () => {
+      process.env.EMBEDDING_PROVIDER = "lmstudio";
+      process.env.EMBEDDING_DIMENSIONS = "768";
+
+      expect(() => loadEmbeddingConfig()).toThrow(
+        /EMBEDDING_MODEL is required when EMBEDDING_PROVIDER=lmstudio/,
+      );
+    });
+
+    it("throws when EMBEDDING_DIMENSIONS is missing", () => {
+      process.env.EMBEDDING_PROVIDER = "lmstudio";
+      process.env.EMBEDDING_MODEL = "nomic-embed-text-v1.5";
+
+      expect(() => loadEmbeddingConfig()).toThrow(
+        /EMBEDDING_DIMENSIONS is required when EMBEDDING_PROVIDER=lmstudio/,
+      );
+    });
+
+    it("includes example dimensions in the error message for discoverability", () => {
+      process.env.EMBEDDING_PROVIDER = "lmstudio";
+      process.env.EMBEDDING_MODEL = "nomic-embed-text-v1.5";
+
+      expect(() => loadEmbeddingConfig()).toThrow(
+        /768 for nomic-embed-text-v1\.5/,
+      );
+    });
+
+    it("does not require LMSTUDIO_API_KEY", () => {
+      process.env.EMBEDDING_PROVIDER = "lmstudio";
+      process.env.EMBEDDING_MODEL = "nomic-embed-text-v1.5";
+      process.env.EMBEDDING_DIMENSIONS = "768";
+      // Intentionally no LMSTUDIO_API_KEY — LM Studio's Local Server has no auth by default.
+
+      expect(() => loadEmbeddingConfig()).not.toThrow();
+    });
+
+    it("respects EMBEDDING_CONTEXT_LENGTH override", () => {
+      process.env.EMBEDDING_PROVIDER = "lmstudio";
+      process.env.EMBEDDING_MODEL = "qwen3-embedding-8b";
+      process.env.EMBEDDING_DIMENSIONS = "4096";
+      process.env.EMBEDDING_CONTEXT_LENGTH = "32768";
+
+      const config = loadEmbeddingConfig();
+      expect(config.embeddingContextLength).toBe(32768);
+    });
+  });
+
+  describe("LMSTUDIO_ALLOW_MISSING_MODEL_LISTING", () => {
+    /** The lmstudio provider needs a model and a dimension before anything else loads. */
+    function lmstudioEnv(): void {
+      process.env.EMBEDDING_PROVIDER = "lmstudio";
+      process.env.EMBEDDING_MODEL = "nomic-embed-text-v1.5";
+      process.env.EMBEDDING_DIMENSIONS = "768";
+    }
+
+    it("defaults to false when unset", () => {
+      lmstudioEnv();
+      expect(loadEmbeddingConfig().allowMissingModelListing).toBe(false);
+    });
+
+    it.each(["true", "TRUE", "True", " true ", "1", "yes"])(
+      "reads %j as enabled",
+      (value) => {
+        lmstudioEnv();
+        process.env.LMSTUDIO_ALLOW_MISSING_MODEL_LISTING = value;
+        expect(loadEmbeddingConfig().allowMissingModelListing).toBe(true);
+      },
+    );
+
+    it.each(["false", "FALSE", "0", "no", "", "  "])(
+      "reads %j as disabled",
+      (value) => {
+        lmstudioEnv();
+        process.env.LMSTUDIO_ALLOW_MISSING_MODEL_LISTING = value;
+        expect(loadEmbeddingConfig().allowMissingModelListing).toBe(false);
+      },
+    );
+
+    // A typo is a request for the flag to be on. Reading it as off used to leave the
+    // operator debugging the behaviour they believed they had turned on.
+    it.each(["ture", "tru", "on", "off", "enabled", "y", "n", "2"])(
+      "rejects %j instead of reading it as disabled",
+      (value) => {
+        lmstudioEnv();
+        process.env.LMSTUDIO_ALLOW_MISSING_MODEL_LISTING = value;
+        expect(() => loadEmbeddingConfig()).toThrow(
+          /Invalid LMSTUDIO_ALLOW_MISSING_MODEL_LISTING/,
+        );
+      },
+    );
+
+    it("names both the variable and the offending value in the error", () => {
+      lmstudioEnv();
+      process.env.LMSTUDIO_ALLOW_MISSING_MODEL_LISTING = "ture";
+      expect(() => loadEmbeddingConfig()).toThrow(
+        /Invalid LMSTUDIO_ALLOW_MISSING_MODEL_LISTING: "ture"/,
+      );
+    });
+
+    // The flag belongs to the lmstudio provider, but it is read unconditionally,
+    // so a stray value must not pass unnoticed under another provider either.
+    it("rejects an unrecognised value under a provider that ignores the flag", () => {
+      process.env.LMSTUDIO_ALLOW_MISSING_MODEL_LISTING = "ture";
+      expect(() => loadEmbeddingConfig()).toThrow(
+        /Invalid LMSTUDIO_ALLOW_MISSING_MODEL_LISTING/,
+      );
+    });
+  });
+
+  describe("litellm provider", () => {
+    it("loads when API key, model, and dimensions are all set", () => {
+      process.env.EMBEDDING_PROVIDER = "litellm";
+      process.env.LITELLM_API_KEY = "sk-master-test";
+      process.env.EMBEDDING_MODEL = "text-embedding-3-small";
+      process.env.EMBEDDING_DIMENSIONS = "1536";
+
+      const config = loadEmbeddingConfig();
+      expect(config.embeddingProvider).toBe("litellm");
+      expect(config.embeddingModel).toBe("text-embedding-3-small");
+      expect(config.embeddingDimensions).toBe(1536);
+    });
+
+    it("defaults LITELLM_URL to http://localhost:4000/v1", () => {
+      process.env.EMBEDDING_PROVIDER = "litellm";
+      process.env.LITELLM_API_KEY = "sk-master-test";
+      process.env.EMBEDDING_MODEL = "text-embedding-3-small";
+      process.env.EMBEDDING_DIMENSIONS = "1536";
+
+      const config = loadEmbeddingConfig();
+      expect(config.litellmUrl).toBe("http://localhost:4000/v1");
+    });
+
+    it("respects LITELLM_URL override", () => {
+      process.env.EMBEDDING_PROVIDER = "litellm";
+      process.env.LITELLM_API_KEY = "sk-master-test";
+      process.env.EMBEDDING_MODEL = "voyage-2";
+      process.env.EMBEDDING_DIMENSIONS = "1024";
+      process.env.LITELLM_URL = "https://litellm.internal:4001/v1";
+
+      const config = loadEmbeddingConfig();
+      expect(config.litellmUrl).toBe("https://litellm.internal:4001/v1");
+    });
+
+    it("throws when LITELLM_API_KEY is missing", () => {
+      process.env.EMBEDDING_PROVIDER = "litellm";
+      process.env.EMBEDDING_MODEL = "text-embedding-3-small";
+      process.env.EMBEDDING_DIMENSIONS = "1536";
+
+      expect(() => loadEmbeddingConfig()).toThrow(
+        /LITELLM_API_KEY is required when EMBEDDING_PROVIDER=litellm/,
+      );
+    });
+
+    it("throws when EMBEDDING_MODEL is missing", () => {
+      process.env.EMBEDDING_PROVIDER = "litellm";
+      process.env.LITELLM_API_KEY = "sk-master-test";
+      process.env.EMBEDDING_DIMENSIONS = "1536";
+
+      expect(() => loadEmbeddingConfig()).toThrow(
+        /EMBEDDING_MODEL is required when EMBEDDING_PROVIDER=litellm/,
+      );
+    });
+
+    it("throws when EMBEDDING_DIMENSIONS is missing", () => {
+      process.env.EMBEDDING_PROVIDER = "litellm";
+      process.env.LITELLM_API_KEY = "sk-master-test";
+      process.env.EMBEDDING_MODEL = "text-embedding-3-small";
+
+      expect(() => loadEmbeddingConfig()).toThrow(
+        /EMBEDDING_DIMENSIONS is required when EMBEDDING_PROVIDER=litellm/,
+      );
+    });
+
+    it("validates the API_KEY check before model/dimension checks", () => {
+      // All three are missing — the API key error must surface first because it's
+      // the only one a virtual-key user can fix without touching the proxy config.
+      process.env.EMBEDDING_PROVIDER = "litellm";
+
+      expect(() => loadEmbeddingConfig()).toThrow(
+        /LITELLM_API_KEY is required/,
+      );
+    });
+
+    it("includes example dimensions in the error message for discoverability", () => {
+      process.env.EMBEDDING_PROVIDER = "litellm";
+      process.env.LITELLM_API_KEY = "sk-master-test";
+      process.env.EMBEDDING_MODEL = "text-embedding-3-small";
+
+      expect(() => loadEmbeddingConfig()).toThrow(
+        /1536 for text-embedding-3-small/,
+      );
+    });
+
+    it("respects EMBEDDING_CONTEXT_LENGTH override for unknown proxy aliases", () => {
+      process.env.EMBEDDING_PROVIDER = "litellm";
+      process.env.LITELLM_API_KEY = "sk-master-test";
+      process.env.EMBEDDING_MODEL = "team-internal-bge-large";
+      process.env.EMBEDDING_DIMENSIONS = "1024";
+      process.env.EMBEDDING_CONTEXT_LENGTH = "8192";
+
+      const config = loadEmbeddingConfig();
+      expect(config.embeddingContextLength).toBe(8192);
+    });
+
+    it("auto-detects context length when alias matches a well-known model name", () => {
+      // LiteLLM aliases are usually named after the underlying model; the context-length
+      // table lookup uses the alias verbatim, so the operator gets free auto-detection
+      // when they keep names aligned.
+      process.env.EMBEDDING_PROVIDER = "litellm";
+      process.env.LITELLM_API_KEY = "sk-master-test";
+      process.env.EMBEDDING_MODEL = "text-embedding-3-small";
+      process.env.EMBEDDING_DIMENSIONS = "1536";
+
+      const config = loadEmbeddingConfig();
+      expect(config.embeddingContextLength).toBe(8191);
     });
   });
 });

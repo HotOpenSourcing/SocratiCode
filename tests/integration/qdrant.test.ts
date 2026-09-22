@@ -1,24 +1,40 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { SOCRATICODE_VERSION } from "../../src/constants.js";
 import { ensureQdrantReady } from "../../src/services/docker.js";
+import {
+  GRAPH_INPUTS_VERSION,
+  type GraphInputRecord,
+  parseGraphInputRecord,
+} from "../../src/services/graph-inputs.js";
+import {
+  requestedIndexProfile,
+} from "../../src/services/index-profile.js";
 import { ensureOllamaReady } from "../../src/services/ollama.js";
 import {
   deleteCollection,
   deleteFileChunks,
+  deleteGraphData,
   deleteProjectMetadata,
   ensureCollection,
   getCollectionInfo,
   getProjectMetadata,
   listCodebaseCollections,
+  loadGraphInputs,
   loadProjectHashes,
+  saveGraphData,
   saveProjectMetadata,
   searchChunks,
   upsertChunks,
 } from "../../src/services/qdrant.js";
 import type { FileChunk } from "../../src/types.js";
 import { isDockerAvailable } from "../helpers/fixtures.js";
-import { deleteTestCollection, waitForOllama, waitForQdrant } from "../helpers/setup.js";
+import {
+  deleteTestCollection,
+  waitForOllama,
+  waitForQdrant,
+} from "../helpers/setup.js";
 
 const dockerAvailable = isDockerAvailable();
 const TEST_COLLECTION = "codebase_test_qdrant_integration";
@@ -45,6 +61,9 @@ describe.skipIf(!dockerAvailable)("qdrant service", () => {
 
       expect(info).toBeDefined();
       expect(info?.status).toBe("green");
+      expect(info?.denseVectorSize).toBe(
+        requestedIndexProfile("code").embedding.dimensions,
+      );
     });
 
     it("is idempotent — creating an existing collection does not error", async () => {
@@ -108,7 +127,12 @@ describe.skipIf(!dockerAvailable)("qdrant service", () => {
     const _embeddings: number[][] = [];
 
     it("upserts chunks with real embeddings (generated internally)", async () => {
-      await upsertChunks(TEST_COLLECTION, chunks, "test-content-hash");
+      await upsertChunks(
+        TEST_COLLECTION,
+        chunks,
+        "test-content-hash",
+        requestedIndexProfile("code"),
+      );
 
       // Verify points were created
       const info = await getCollectionInfo(TEST_COLLECTION);
@@ -224,13 +248,22 @@ describe.skipIf(!dockerAvailable)("qdrant service", () => {
         ["src/math.ts", "hash-math"],
       ]);
 
-      await saveProjectMetadata(metadataCollection, projectPath, 42, 2, fileHashes, "completed");
+      await saveProjectMetadata(
+        metadataCollection,
+        projectPath,
+        42,
+        2,
+        fileHashes,
+        "completed",
+        requestedIndexProfile("code"),
+      );
 
       const metadata = await getProjectMetadata(metadataCollection);
       expect(metadata).toBeDefined();
       expect(metadata?.projectPath).toBe(projectPath);
       expect(metadata?.filesTotal).toBe(42);
       expect(metadata?.filesIndexed).toBe(2);
+      expect(metadata?.effectiveProfile).toEqual(requestedIndexProfile("code"));
     });
 
     it("loads project hashes", async () => {
@@ -246,6 +279,56 @@ describe.skipIf(!dockerAvailable)("qdrant service", () => {
       const metadata = await getProjectMetadata(metadataCollection);
       expect(metadata).toBeNull();
     });
+  });
+
+  describe("graph input record", () => {
+    // The record shares a point with the serialized graph and is read back
+    // through a payload projection, which is Qdrant behaviour rather than
+    // ours — so the round-trip is pinned against a real one. (That the read is
+    // projected is not observable from here; it is a cost, not a contract.)
+    const graphCollection = "codebase_test_graph_inputs";
+    const record: GraphInputRecord = {
+      version: GRAPH_INPUTS_VERSION,
+      builtByVersion: SOCRATICODE_VERSION,
+      capabilities: "aabbccddeeff0011",
+      files: { "src/auth.ts": "0123456789abcdef", "go.mod": "fedcba9876543210" },
+      heads: { NOTES: "aabbccddeeff0011" },
+      presence: { "src/huge.ts": 1_234_567 },
+      unreadable: ["vendor/locked.json"],
+      unreadableDirectories: ["vendor/private"],
+      directories: {
+        ".": { all: "1122334455667788", kept: "2233445566778899" },
+        src: { all: "8877665544332211", kept: "7766554433221100" },
+      },
+      settings: "00112233445566ff",
+    };
+
+    afterAll(async () => {
+      await deleteGraphData(graphCollection);
+    });
+
+    it("round-trips the record stored beside the graph", async () => {
+      await saveGraphData(graphCollection, "/test/project/path", { nodes: [], edges: [] }, record);
+
+      const stored = await loadGraphInputs(graphCollection);
+
+      // Projected out of a payload that also holds the whole graph, and read
+      // back through the string form it is persisted as.
+      expect(stored.status).toBe("stored");
+      const value = stored.status === "stored" ? stored.value : null;
+      expect(typeof value).toBe("string");
+      expect(parseGraphInputRecord(value)).toEqual(record);
+    });
+
+    it("reports an absent point apart from a record it could not parse", async () => {
+      // The distinction the rebuild gate turns on: no graph at all is the one
+      // case an update that indexed nothing must not act on, while a graph
+      // with no usable record has to rebuild once and populate.
+      await expect(loadGraphInputs("codebase_test_graph_inputs_absent")).resolves.toEqual({
+        status: "absent",
+      });
+    });
+
   });
 
   describe("collection deletion", () => {

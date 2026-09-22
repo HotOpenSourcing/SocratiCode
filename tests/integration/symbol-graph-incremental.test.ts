@@ -8,11 +8,22 @@ import {
   invalidateGraphCache,
   rebuildGraph,
 } from "../../src/services/code-graph.js";
+import {
+  dropSymbolGraphCache,
+  getSymbolGraphCache,
+  type SymbolGraphReaderRelease,
+} from "../../src/services/symbol-graph-cache.js";
 import { updateChangedFilesSymbolGraph } from "../../src/services/symbol-graph-incremental.js";
 import {
+  deleteSymbolGraphData,
+  LEGACY_SYMBOL_GRAPH_GENERATION,
+  listStoredGenerations,
   loadFilePayload,
   loadSymbolGraphMeta,
+  saveFilePayload,
+  saveSymbolGraphMeta,
 } from "../../src/services/symbol-graph-store.js";
+import type { SymbolGraphFilePayload, SymbolGraphMeta } from "../../src/types.js";
 import {
   createFixtureProject,
   type FixtureProject,
@@ -56,7 +67,7 @@ describe.skipIf(!dockerAvailable)(
       expect(result.filesRemoved).toBe(0);
     });
 
-    it("re-extracts and persists a changed file's payload", async () => {
+    it("returns fullRebuildRequired=true on a changed file and full rebuild persists new symbols", async () => {
       const graph = await rebuildGraph(fixture.root);
       const rel = "src/index.ts";
 
@@ -77,8 +88,10 @@ describe.skipIf(!dockerAvailable)(
           [rel],
           [],
         );
-        expect(result.fullRebuildRequired).toBe(false);
-        expect(result.filesChanged).toBe(1);
+        expect(result.fullRebuildRequired).toBe(true);
+
+        // Rebuild graph via caller fallback
+        await rebuildGraph(fixture.root);
 
         // The new symbol should appear in the persisted payload.
         const payload = await loadFilePayload(projectId, rel);
@@ -90,26 +103,7 @@ describe.skipIf(!dockerAvailable)(
       }
     });
 
-    it("is a no-op when content hash is unchanged", async () => {
-      const graph = await rebuildGraph(fixture.root);
-      const rel = "src/index.ts";
-      const before = await loadSymbolGraphMeta(projectId);
-      const result = await updateChangedFilesSymbolGraph(
-        projectId,
-        fixture.root,
-        graph,
-        [rel],
-        [],
-      );
-      // The diff path detects identical hash and skips writes.
-      expect(result.fullRebuildRequired).toBe(false);
-      expect(result.symbolsDelta).toBe(0);
-      expect(result.edgesDelta).toBe(0);
-      const after = await loadSymbolGraphMeta(projectId);
-      expect(after?.symbolCount).toBe(before?.symbolCount);
-    });
-
-    it("removes a deleted file's payload from the store", async () => {
+    it("returns fullRebuildRequired=true when a file is removed", async () => {
       const graph = await rebuildGraph(fixture.root);
       const rel = "src/utils/helpers.ts";
       // Confirm baseline.
@@ -123,11 +117,7 @@ describe.skipIf(!dockerAvailable)(
         [],
         [rel],
       );
-      expect(result.fullRebuildRequired).toBe(false);
-      expect(result.filesRemoved).toBe(1);
-
-      const after = await loadFilePayload(projectId, rel);
-      expect(after).toBeNull();
+      expect(result.fullRebuildRequired).toBe(true);
     });
 
     it("handles symbols whose names collide with Object.prototype keys (regression)", async () => {
@@ -155,8 +145,6 @@ describe.skipIf(!dockerAvailable)(
         "utf-8",
       );
       try {
-        // The original crash happened during the *full* persistSymbolGraph
-        // path, so exercise that as well.
         await rebuildGraph(fixture.root);
         const meta = await loadSymbolGraphMeta(projectId);
         expect(meta).not.toBeNull();
@@ -166,9 +154,6 @@ describe.skipIf(!dockerAvailable)(
         // All three prototype-collision names must be present.
         expect(names).toEqual(expect.arrayContaining(["constructor", "toString", "hasOwnProperty"]));
 
-        // And the incremental path must also accept them without throwing.
-        // Mutate the file so the incremental layer doesn't skip it as
-        // unchanged (its hash already matches after the full rebuild above).
         fs.appendFileSync(filePath, "\nexport const PROTO_KEYS_REV = 2;\n", "utf-8");
         const graph = await rebuildGraph(fixture.root, { skipSymbolGraph: true });
         const result = await updateChangedFilesSymbolGraph(
@@ -178,10 +163,140 @@ describe.skipIf(!dockerAvailable)(
           [rel],
           [],
         );
-        expect(result.fullRebuildRequired).toBe(false);
-        expect(result.filesChanged).toBe(1);
+        expect(result.fullRebuildRequired).toBe(true);
       } finally {
         try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+      }
+    });
+
+    it("full rebuild persists a detected extensionless Python file; .txt-detected is excluded", async () => {
+      const pyRel = "tools/gen";
+      const txtRel = "tools/legacy";
+      fs.mkdirSync(path.join(fixture.root, "tools"), { recursive: true });
+      fs.writeFileSync(
+        path.join(fixture.root, pyRel),
+        "def make_manifest():\n    return 1\n\nclass Builder:\n    def run(self):\n        return make_manifest()\n",
+        "utf-8",
+      );
+      fs.writeFileSync(path.join(fixture.root, txtRel), "#!/usr/bin/perl\nprint \"legacy\\n\";\n", "utf-8");
+      try {
+        await rebuildGraph(fixture.root);
+
+        const pyPayload = await loadFilePayload(projectId, pyRel);
+        expect(pyPayload).toBeTruthy();
+        expect(pyPayload?.language).toBe("python");
+        const names = pyPayload?.symbols.map((s) => s.name) ?? [];
+        expect(names).toEqual(expect.arrayContaining(["make_manifest", "Builder"]));
+
+        // .txt-detected file contributes no symbol payload (not in the graph).
+        const txtPayload = await loadFilePayload(projectId, txtRel);
+        expect(txtPayload).toBeNull();
+      } finally {
+        try {
+          fs.rmSync(path.join(fixture.root, "tools"), { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+  },
+);
+
+describe.skipIf(!dockerAvailable)(
+  "symbol-graph legacy generation compatibility",
+  { timeout: 120_000 },
+  () => {
+    it("keeps a schema-v1 reader stable until the replacement generation is committed", async () => {
+      await waitForQdrant();
+      const legacyFixture = createFixtureProject("symbol-graph-legacy-generation-test");
+      const legacyProjectId = projectIdFromPath(legacyFixture.root);
+      const relativePath = "src/index.ts";
+      const absolutePath = path.join(legacyFixture.root, relativePath);
+      let releaseLegacyReader: SymbolGraphReaderRelease | undefined;
+
+      const legacyPayload: SymbolGraphFilePayload = {
+        file: relativePath,
+        language: "typescript",
+        contentHash: "legacy-content-hash",
+        symbols: [{
+          id: `${relativePath}::legacyEntry#1`,
+          name: "legacyEntry",
+          qualifiedName: "legacyEntry",
+          kind: "function",
+          isExported: true,
+          file: relativePath,
+          line: 1,
+          endLine: 1,
+          language: "typescript",
+        }],
+        outgoingCalls: [],
+      };
+      const legacyMeta: SymbolGraphMeta = {
+        projectId: legacyProjectId,
+        symbolCount: 1,
+        edgeCount: 0,
+        fileCount: 1,
+        unresolvedEdgePct: 0,
+        builtAt: Date.now(),
+        schemaVersion: 1,
+      };
+
+      try {
+        await deleteSymbolGraphData(legacyProjectId);
+        dropSymbolGraphCache(legacyProjectId);
+        await saveFilePayload(legacyProjectId, legacyPayload);
+        await saveSymbolGraphMeta(legacyProjectId, legacyMeta);
+
+        const legacyCache = await getSymbolGraphCache(legacyProjectId);
+        expect(legacyCache).not.toBeNull();
+        if (!legacyCache) return;
+        releaseLegacyReader = legacyCache.acquireReader();
+
+        fs.writeFileSync(
+          absolutePath,
+          "export function currentEntry(): number { return 2; }\n",
+          "utf-8",
+        );
+        await rebuildGraph(legacyFixture.root);
+
+        const legacyRead = await legacyCache.getFilePayload(
+          relativePath,
+          releaseLegacyReader.token,
+        );
+        expect(legacyRead?.symbols.map((symbol) => symbol.name)).toContain("legacyEntry");
+        expect(legacyRead?.symbols.map((symbol) => symbol.name)).not.toContain("currentEntry");
+
+        const currentCache = await getSymbolGraphCache(legacyProjectId);
+        expect(currentCache?.meta.generation).toBeDefined();
+        const currentGeneration = currentCache?.meta.generation;
+        const currentRead = await currentCache?.getFilePayload(relativePath);
+        expect(currentRead?.symbols.map((symbol) => symbol.name)).toContain("currentEntry");
+        expect(await listStoredGenerations(legacyProjectId)).toEqual(
+          expect.arrayContaining([
+            LEGACY_SYMBOL_GRAPH_GENERATION,
+            currentGeneration,
+          ]),
+        );
+
+        releaseLegacyReader();
+        releaseLegacyReader = undefined;
+
+        const deadline = Date.now() + 5_000;
+        let generations = await listStoredGenerations(legacyProjectId);
+        while (
+          generations.includes(LEGACY_SYMBOL_GRAPH_GENERATION)
+          && Date.now() < deadline
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          generations = await listStoredGenerations(legacyProjectId);
+        }
+        expect(generations).toEqual([currentGeneration]);
+      } finally {
+        releaseLegacyReader?.();
+        dropSymbolGraphCache(legacyProjectId);
+        invalidateGraphCache(legacyFixture.root);
+        try { await deleteSymbolGraphData(legacyProjectId); } catch { /* ignore */ }
+        legacyFixture.cleanup();
       }
     });
   },

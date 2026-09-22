@@ -5,7 +5,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { SOCRATICODE_VERSION } from "./constants.js";
+import { EXTENSION_LANGUAGE_MAP_INVALID, getWatcherMode, SOCRATICODE_VERSION } from "./constants.js";
 import { logger, setMcpLogSender } from "./services/logger.js";
 import { autoResumeIndexedProjects, gracefulShutdown } from "./services/startup.js";
 import { handleContextTool } from "./tools/context-tools.js";
@@ -13,6 +13,10 @@ import { handleGraphTool } from "./tools/graph-tools.js";
 import { handleIndexTool } from "./tools/index-tools.js";
 import { handleManageTool } from "./tools/manage-tools.js";
 import { handleQueryTool } from "./tools/query-tools.js";
+
+// Validate lifecycle configuration before the server accepts any tools. An
+// invalid manual-mode value must never fall back to automatic index writes.
+getWatcherMode();
 
 const server = new McpServer(
   {
@@ -22,6 +26,9 @@ const server = new McpServer(
   {
     capabilities: {
       tools: {},
+      // Required for the log forwarding below: the SDK sends notifications/message
+      // (and accepts logging/setLevel) only when the server declares it.
+      logging: {},
     },
   },
 );
@@ -56,7 +63,7 @@ server.tool(
 
 server.tool(
   "codebase_update",
-  "Incrementally update an existing codebase index. Only re-indexes changed files. Runs synchronously. Usually not needed if file watcher is active.",
+  "Incrementally update an existing codebase index. Only re-indexes changed files. Runs synchronously. Use it to refresh a manual/off snapshot, or whenever an immediate catch-up is needed.",
   {
     projectPath: z
       .string()
@@ -84,6 +91,20 @@ server.tool(
 );
 
 server.tool(
+  "codebase_prune",
+  "Inventory stored project identities and their resources. Report-only by default. Applying requires an exact identity, the confirmation token from a fresh inventory, and an acknowledgement that no other host is writing to it; path absence on this host is advisory, not proof of abandonment.",
+  {
+    apply: z.boolean().optional().describe("Delete the selected identity only when true. Omit for the report-only inventory."),
+    identity: z.string().optional().describe("Exact identity returned by codebase_prune."),
+    confirmationToken: z.string().optional().describe("Opaque token returned for that identity by codebase_prune."),
+    acknowledgeNoRemoteWriters: z.boolean().optional().describe("Required with apply. Locks on this host cannot see another host sharing the same Qdrant; true states that none is writing to this identity."),
+  },
+  async (args) => ({
+    content: [{ type: "text", text: await handleIndexTool("codebase_prune", args) }],
+  }),
+);
+
+server.tool(
   "codebase_stop",
   "Gracefully stop an in-progress indexing operation. The current batch will finish and checkpoint, preserving all progress. Re-run codebase_index to resume from where it left off.",
   {
@@ -99,7 +120,7 @@ server.tool(
 
 server.tool(
   "codebase_watch",
-  "Start/stop watching a project directory for file changes and automatically update the index. When starting, first runs an incremental update to catch any changes made since the last session, then keeps the index up to date via debounced file system watching.",
+  "Start/stop watching a project directory for file changes and automatically update the index. When starting, first runs an incremental update to catch up, then watches for changes. SOCRATICODE_WATCHER=manual allows explicit starts only; off rejects starts.",
   {
     projectPath: z
       .string()
@@ -288,7 +309,9 @@ server.tool(
   "Impact Analysis — return the BLAST RADIUS for a file or symbol. Lists every file (and, where helpful, function) that could break if you change the target. Polymorphic on target: a path-like string ('src/foo.ts') triggers file-mode; a name-like string ('validateUser') triggers symbol-mode. Use this BEFORE refactoring, renaming, or deleting code to know what depends on it.",
   {
     projectPath: z.string().describe("Absolute path to the project directory.").optional(),
-    target: z.string().describe("Target file path (relative) OR symbol name."),
+    target: z.string().describe("Target file path (relative) OR symbol name.").optional(),
+    file: z.string().describe("Optional file path to disambiguate the target symbol.").optional(),
+    symbolId: z.string().describe("Exact symbol ID (e.g. 'src/foo.ts::validateUser#10') to disambiguate.").optional(),
     depth: z.number().describe("How many hops back to walk (default 3, max 10).").optional(),
   },
   async (args) => ({
@@ -444,6 +467,16 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
+  // Surface any EXTENSION_LANGUAGE_MAP entries we had to drop (malformed, or a
+  // target language with no AST grammar) rather than silently ignoring them.
+  if (EXTENSION_LANGUAGE_MAP_INVALID.length > 0) {
+    logger.warn(
+      "EXTENSION_LANGUAGE_MAP: ignored invalid entries. Each must be `<ext>:<language>` " +
+      "with a language SocratiCode has an AST grammar for (e.g. .inc:php).",
+      { ignored: EXTENSION_LANGUAGE_MAP_INVALID },
+    );
+  }
+
   // Auto-resume watchers and incremental updates for already-indexed projects
   // Fire-and-forget — runs in background, non-blocking, non-fatal
   autoResumeIndexedProjects();
@@ -489,6 +522,10 @@ async function main() {
   process.stdin.on("end", () => shutdown("stdin EOF"));
   process.stdin.on("error", () => shutdown("stdin error"));
   process.stdin.on("close", () => shutdown("stdin close"));
+  // Log lines go to stdout as notifications/message. Once the host has closed
+  // its end, that write fails with EPIPE; unhandled, the error would exit the
+  // process in the middle of shutdown instead of letting it finish.
+  process.stdout.on("error", () => shutdown("stdout error"));
 }
 
 main().catch((err) => {

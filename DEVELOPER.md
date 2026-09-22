@@ -19,6 +19,7 @@ This document covers the internals of **SocratiCode** — architecture, data flo
 - [Data Structures](#data-structures)
 - [Docker & Infrastructure](#docker--infrastructure)
 - [Extending the Indexer](#extending-the-indexer)
+- [VS Code / Open VSX Extension](#vs-code--open-vsx-extension)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -167,9 +168,16 @@ npm run release:dry
 This will automatically:
 1. Determine the version bump from your commits
 2. Update `CHANGELOG.md` with all `feat:`, `fix:`, etc. entries
-3. Bump the version in `package.json`
-4. Create a git commit and tag (`v1.1.0`)
-5. Push to GitHub and create a GitHub Release
+3. Bump the version in `package.json`, plugin manifests, Gemini extension manifest, VS Code extension package files, and `server.json`
+4. Publish the npm package
+5. Create and push a git commit and tag (`v1.1.0`), then create a GitHub Release
+6. Publish matching VS Code, Open VSX, and official MCP Registry entries from the tag workflows
+
+The MCP Registry workflow verifies that the tag, root package, and every release
+manifest carry the same version, waits for that exact npm package to become
+available, validates `server.json`, and publishes with GitHub OIDC. It uses no
+long-lived Registry credential. A failure stops the Registry job and leaves the
+underlying npm and GitHub release visible for diagnosis and a workflow rerun.
 
 ---
 
@@ -177,7 +185,7 @@ This will automatically:
 
 ```
 src/
-├── index.ts                 # MCP server entry point — registers all 21 tools
+├── index.ts                 # MCP server entry point; registers all SocratiCode tools
 ├── config.ts                # Project ID generation (SHA-256), collection naming, linked projects, branch detection
 ├── constants.ts             # All constants: ports, container names, models, chunk sizes, extensions
 ├── types.ts                 # TypeScript interfaces and types
@@ -195,7 +203,7 @@ src/
 │   ├── code-graph.ts        # AST-based code graph building via ast-grep
 │   ├── graph-analysis.ts    # Graph queries: dependencies, stats, cycles, Mermaid diagrams
 │   ├── graph-aliases.ts     # Path alias resolution from tsconfig/jsconfig compilerOptions.paths
-│   ├── graph-imports.ts     # Import/require/use extraction for 18+ languages via AST
+│   ├── graph-imports.ts     # Import/require/use extraction for 19+ languages via AST
 │   ├── graph-resolution.ts  # Module specifier → file path resolution (incl. aliases, SCSS partials)
 │   ├── graph-symbols.ts     # Per-language symbol & call-site extraction (Impact Analysis)
 │   ├── graph-symbol-resolution.ts  # Three-tier cross-file call-site resolution
@@ -207,7 +215,7 @@ src/
 │   └── context-artifacts.ts # Context artifact loading, chunking, indexing, search
 │
 ├── tools/
-│   ├── index-tools.ts       # Handlers: codebase_index, codebase_update, codebase_remove, codebase_stop, codebase_watch
+│   ├── index-tools.ts       # Handlers: codebase_index, codebase_update, codebase_remove, codebase_prune, codebase_stop, codebase_watch
 │   ├── query-tools.ts       # Handlers: codebase_search, codebase_status
 │   ├── graph-tools.ts       # Handlers: codebase_graph_*, codebase_impact, codebase_flow, codebase_symbol(s)
 │   ├── context-tools.ts     # Handlers: codebase_context, codebase_context_search/index/remove
@@ -217,9 +225,9 @@ tests/
 ├── helpers/
 │   ├── fixtures.ts          # Test fixture utilities (temp projects, Docker checks)
 │   └── setup.ts             # Integration test infrastructure (Qdrant client, cleanup)
-├── unit/                    # 608 tests — no Docker required
-├── integration/             # 137 tests — requires Docker
-└── e2e/                     # 20 tests — full lifecycle
+├── unit/                    # No Docker required
+├── integration/             # Requires Docker
+└── e2e/                     # Full lifecycle
 
 docker-compose.yml           # Alternative way to run infrastructure
 vitest.config.ts             # Test framework configuration
@@ -236,10 +244,10 @@ All constants are defined in `src/constants.ts`:
 | `SEARCH_DEFAULT_LIMIT` | `10` | Default search results per query (env-configurable, 1-50) |
 | `SEARCH_MIN_SCORE` | `0.10` | Minimum RRF score threshold (env-configurable, 0-1) |
 | `CHUNK_SIZE` | `100` | Lines per chunk |
-| `CHUNK_OVERLAP` | `10` | Overlapping lines between adjacent chunks |
+| `CHUNK_OVERLAP` | `10` | Overlapping lines between chunks cut by line count — adjacent AST declaration chunks do not overlap |
 | `MAX_FILE_BYTES` | `5 MB` | Max file size before skipping (env-configurable via `MAX_FILE_SIZE_MB`) |
 | `MAX_AVG_LINE_LENGTH` | `500` | Avg line length above which character-based chunking is used (minified files) |
-| `MAX_CHUNK_CHARS` | `2000` | Hard character limit per chunk (provider-level safety net) |
+| `MAX_CHUNK_CHARS` | `2000` | Character limit per chunk, and on a format-2 collection the boundary an over-long chunk is split at (env-configurable via `MAX_CHUNK_CHARS`) |
 | `QDRANT_PORT` | `16333` | Qdrant HTTP API port (host-side) |
 | `QDRANT_GRPC_PORT` | `16334` | Qdrant gRPC port (host-side) |
 | `QDRANT_CONTAINER_NAME` | `socraticode-qdrant` | Docker container name |
@@ -247,6 +255,8 @@ All constants are defined in `src/constants.ts`:
 | `OLLAMA_PORT` | `11435` | Ollama API port (host-side) |
 | `OLLAMA_CONTAINER_NAME` | `socraticode-ollama` | Docker container name |
 | `OLLAMA_IMAGE` | `ollama/ollama:latest` | Docker image |
+
+`getWatcherMode()` resolves `SOCRATICODE_WATCHER=auto|manual|off` at call time and rejects unknown values. `src/index.ts` invokes it during startup so invalid lifecycle configuration fails before tools are accepted.
 
 > **Note**: `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, and `EMBEDDING_CONTEXT_LENGTH` are defined in `src/services/embedding-config.ts`, not in `src/constants.ts`. Defaults are `nomic-embed-text` / `768` for Ollama, `text-embedding-3-small` / `1536` for OpenAI, and `gemini-embedding-001` / `3072` for Google.
 
@@ -260,7 +270,7 @@ Defined in `src/services/watcher.ts`: file changes are debounced for **2000ms** 
 
 ### Maximum file size
 
-Defined in `src/constants.ts` as `MAX_FILE_BYTES`: files larger than **5 MB** are skipped (configurable via `MAX_FILE_SIZE_MB` env var).
+Defined in `src/constants.ts` as `MAX_FILE_BYTES`: files larger than **5 MB** are skipped (configurable via `MAX_FILE_SIZE_MB` env var). The value is parsed as a complete finite number, so partial values such as `5MB` are rejected rather than silently truncated.
 
 ### Qdrant health check
 
@@ -268,23 +278,30 @@ Defined in `src/services/docker.ts`: after starting the container, the server po
 
 ### Project ID & Collection Naming
 
-Defined in `src/config.ts`:
-- **Project ID**: First 12 characters of SHA-256 hash of the absolute project path.
+Defined in `src/config.ts`. `projectIdFromPath()` resolves the project ID with the following precedence (highest first):
+
+1. **`SOCRATICODE_PROJECT_ID` env var** — per-machine override; bypasses both file lookup and path hashing.
+2. **`projectId` field in `.socraticode.json`** — committed, team-wide stable identifier; survives different filesystem layouts and OS users.
+3. **First 12 characters of SHA-256 of the absolute project path** — default fallback.
+
+In both override paths the value must match `[a-zA-Z0-9_-]+`; whitespace is trimmed; empty/whitespace-only values fall through to the next level. Invalid characters in an explicit override fail loud (throw) — silent fallback would hide misconfigurations that map a project to the wrong (or new) collection.
+
+Collection names derived from the project ID:
 - **Code collection**: `codebase_{projectId}`
 - **Graph collection**: `codegraph_{projectId}`
 - **Context artifacts collection**: `context_{projectId}`
 
-This means the same folder path always maps to the same collection, even across restarts.
+With the default (path-hash) ID, the same folder path always maps to the same collection across restarts. With either override, the mapping is stable across machines and checkouts.
 
 #### Branch-aware mode
 
-When `SOCRATICODE_BRANCH_AWARE=true`, the current git branch is detected via `git rev-parse --abbrev-ref HEAD` and appended to the project ID (e.g. `abc123def456__feat_my-feature`). Branch names are sanitized: non-alphanumeric characters (except `-`) become `_`, consecutive underscores collapse, leading/trailing underscores are stripped. Detached HEAD states fall back to the branchless ID. Ignored when `SOCRATICODE_PROJECT_ID` is set explicitly.
+When `SOCRATICODE_BRANCH_AWARE=true`, the current git branch is detected via `git rev-parse --abbrev-ref HEAD` and appended to the project ID (e.g. `abc123def456__feat_my-feature`). Branch names are sanitized: non-alphanumeric characters (except `-`) become `_`, consecutive underscores collapse, leading/trailing underscores are stripped. Detached HEAD states fall back to the branchless ID. Ignored when `SOCRATICODE_PROJECT_ID` is set explicitly or when `projectId` is set in `.socraticode.json` — explicit identifiers are treated as stable and not augmented per branch.
 
 #### Linked projects
 
 `loadLinkedProjects()` reads `.socraticode.json` and `SOCRATICODE_LINKED_PROJECTS` env var. `resolveLinkedCollections()` maps linked paths to `{ name, label }` descriptors for `searchMultipleCollections()`. The current project is always first (highest dedup priority).
 
-### Supported File Extensions (54)
+### Supported File Extensions (63)
 
 | Category | Extensions |
 |----------|-----------|
@@ -299,14 +316,17 @@ When `SOCRATICODE_BRANCH_AWARE=true`, the current git branch is detected via `gi
 | PHP | `.php` |
 | Swift | `.swift` |
 | Shell | `.sh`, `.bash`, `.zsh` |
-| Web | `.html`, `.htm`, `.css`, `.scss`, `.sass`, `.less`, `.vue`, `.svelte` |
+| Web | `.html`, `.htm`, `.css`, `.scss`, `.sass`, `.less`, `.styl`, `.vue`, `.svelte` |
 | Config | `.json`, `.yaml`, `.yml`, `.toml`, `.xml`, `.ini`, `.cfg` |
 | Documentation | `.md`, `.mdx`, `.rst`, `.txt` |
 | SQL | `.sql` |
 | Dart | `.dart` |
+| Elixir | `.ex`, `.exs`, `.heex`, `.eex`, `.leex` |
 | Lua | `.lua` |
 | R | `.r`, `.R` |
 | Docker | `.dockerfile` |
+| GDScript (Godot) | `.gd` |
+| Godot Resources | `.tscn`, `.tres` |
 
 Special files always indexed: `Dockerfile`, `Makefile`, `Rakefile`, `Gemfile`, `Procfile`, `.env.example`, `.gitignore`, `.dockerignore`.
 
@@ -334,20 +354,26 @@ When `codebase_index` is called:
    ├── Check for nomic-embed-text model
    └── Pull model if missing
 
-2. FILE DISCOVERY
+2. EFFECTIVE PROFILE RESOLUTION
+   ├── Load the collection's versioned effective index profile
+   ├── Infer released legacy defaults when existing metadata has no profile
+   ├── Keep requested changes pending for a collection that already has vectors
+   └── Use requested settings only when no collection profile remains; an empty profiled collection still keeps its profile
+
+3. FILE DISCOVERY
    getIndexableFiles(projectPath, extraExts?)
    ├── glob("**/*") to enumerate all files
    ├── Build ignore filter: defaults + .gitignore + .socraticodeignore
    ├── Filter by supported extension, special filename, or extra extensions
    └── Filter out ignored paths
 
-3. COLLECTION SETUP
+4. COLLECTION SETUP
    ensureCollection(collectionName)
    ├── Check if collection exists
    ├── Create with: provider-dependent dimensions (768/1536/3072), cosine distance, on-disk payload
    └── Create payload indexes: filePath, relativePath, language, contentHash
 
-4. FILE SCANNING & CHUNKING (parallel batches of 50 files)
+5. FILE SCANNING & CHUNKING (parallel batches of 50 files)
    ├── Read file content (skip if > 5 MB or unreadable)
    ├── Hash content: SHA-256 → 16-char prefix
    ├── Skip if hash matches existing (re-index mode)
@@ -359,20 +385,21 @@ When `codebase_index` is called:
    │   │   ├── Small declarations merged, large ones sub-chunked
    │   │   └── Preamble (imports) and epilogue handled separately
    │   └── Line-based fallback: 100-line segments with 10-line overlap
-   ├── Hard character cap (2000 chars) applied to all chunks
+   ├── Character cap (`MAX_CHUNK_CHARS`, default 2000 chars): on a format-2 collection a chunk over the cap is split, not truncated
    ├── Generate chunk ID: SHA-256 of "filePath:startLine" formatted as UUID
+   │   └── A piece split off by the cap is seeded from its parent's ID instead
    └── Detect language from file extension
 
-5. BATCHED EMBEDDING + UPSERT (50 files per batch)
+6. BATCHED EMBEDDING + UPSERT (50 files per batch)
    For each batch of files:
-   ├── Prepare text: "search_document: {relativePath}\n{content}"
+   ├── Prepare text: "{documentPrefix}{relativePath}\n{content}" (prefix defaults to "search_document: ", see EMBEDDING_DOCUMENT_PREFIX; the path is dropped when EMBEDDING_DOCUMENT_INCLUDE_PATH=false)
    ├── Generate embeddings via configured provider (further batched internally)
    ├── Upsert to Qdrant with dense vector + BM25 text + payload
    ├── Update in-memory file hashes
    ├── Checkpoint: persist hashes to Qdrant (progress survives crashes)
    └── Check for cancellation request before next batch
 
-6. POST-INDEX
+7. POST-INDEX
    ├── Save final metadata (status: "completed")
    ├── Auto-build code dependency graph (non-fatal on failure)
    └── Auto-index context artifacts if config exists (non-fatal on failure)
@@ -386,8 +413,9 @@ When `codebase_search` is called:
 
 ```
 1. Generate query embedding
-   ├── Prepare text: "search_query: {query}"
-   └── Send to configured embedding provider → provider-dependent vector (768 / 1536 / 3072 dims)
+   ├── Load the collection's effective query and embedding profile
+   ├── Prepare text with that profile's query prefix
+   └── Send to that profile's provider and model
 
 2. HYBRID SEARCH (dense + BM25, RRF-fused)
    ├── Build two parallel prefetch sub-queries:
@@ -408,6 +436,18 @@ The `nomic-embed-text` model uses task-specific prefixes for asymmetric retrieva
 - **Queries** are prefixed with `search_query: ` — this tells the model to encode as a search query.
 
 This asymmetric encoding significantly improves retrieval quality.
+
+These are the defaults, kept for backward compatibility. Override them with `EMBEDDING_QUERY_PREFIX` / `EMBEDDING_DOCUMENT_PREFIX` to match a different model's expected prefixes (e.g. `query: ` / `passage: ` for `multilingual-e5-*`, none for `bge-m3`). See the README's environment variable table for the full details.
+
+### Effective Index Profiles
+
+Each code collection and context collection stores a versioned effective profile. It records the query and document prefixes, document-path inclusion, chunk cap, embedding provider, model, dimensions, effective context length, LiteLLM dimensions flag, and format version. Code profiles also record the extension-language map and maximum file size.
+
+An existing collection always uses its effective profile for incremental updates, watcher events, and search. Requested differences are status-only pending changes. Removing and freshly indexing the collection records the requested profile. A legacy collection without profile metadata adopts the released prefix, path, and chunk defaults without rewriting vectors; unavailable historical embedding and code-scanning values are marked `legacy-unverified`.
+
+Linked search computes one query vector per compatible verified effective query profile. Legacy-unverified embedding identities are never grouped across collections.
+
+Context artifact states also store a configuration signature covering the configured path, resolved path, and description. A signature change replaces that artifact's vectors and payloads even when its content hash is unchanged.
 
 ---
 
@@ -448,12 +488,20 @@ When `codebase_graph_build` is called:
 1. BACKGROUND EXECUTION (fire-and-forget)
    ├── Tool returns immediately with "build started" message
    ├── Actual build runs asynchronously on the event loop
-   ├── Progress tracked via GraphBuildProgress { filesTotal, filesProcessed, phase }
+   ├── Progress tracked via GraphBuildProgress { filesTotal, filesProcessed, filesSkipped, phase }
    └── Client polls codebase_graph_status for progress %
 
 2. FILE DISCOVERY (phase: "scanning files")
    ├── Get graphable files from project (same ignore filters as indexing)
-   └── Include files with AST-grep grammar + files with extra extensions
+   ├── Include files with AST-grep grammar + files with extra extensions
+   ├── Extensionless files: admitted only when content detection on the first
+   │   8 KB yields a grammar-bearing extension; that extension is returned
+   │   alongside the path so the parse step need not head-read them again
+   └── Sort the file list lexicographically — Node documents no readdir ordering,
+       and a depth-first walk additionally interleaves a directory's contents with
+       the sibling entries that sort after it (a/x.ts before a.ts), while
+       processing order drives node insertion order and the JVM suffix map's
+       duplicate-class tie-break
 
 3. PARSE IMPORTS (phase: "analyzing imports", per file, via ast-grep)
    ├── Determine AST-grep language from file extension
@@ -473,11 +521,27 @@ When `codebase_graph_build` is called:
    │   ├── Swift: import
    │   ├── Bash: source, . (dot)
    │   ├── Dart/Lua: regex-based extraction
+   │   ├── GDScript: preload()/load() (res://, uid://, relative paths), extends ClassName, extends "res://path.gd", extends "relative.gd"
    │   ├── Svelte/Vue: HTML parse → <script> extraction → re-parse as TypeScript
    │   ├── Svelte/Vue: HTML parse → <style> extraction → CSS @import/@require regex
    │   └── CSS/SCSS/SASS/LESS: @import/@import url()/@require regex extraction
    ├── Tag CSS imports with isCssImport flag (for correct resolution extensions)
    ├── Update progress: filesProcessed++
+   ├── Extensionless files are re-detected on the bytes about to be parsed and
+   │   parsed under the grammar those bytes call for, so content that changed
+   │   since discovery is followed rather than dropped
+   ├── Skipped files count toward filesProcessed too and increment filesSkipped,
+   │   with the reason logged at debug and a per-reason breakdown in the
+   │   "Code graph built" log: oversized (> MAX_GRAPH_FILE_BYTES), vanished
+   │   (ENOENT between discovery and read), read-failed (any other fault, e.g.
+   │   EACCES/EIO/EMFILE), content-changed (extensionless only: re-detection on
+   │   the parsed bytes no longer yields a grammar-bearing language, so there is
+   │   no grammar to parse it with). A skipped file builds no node of its own and
+   │   contributes no outgoing edges; if another file imports it, the importer's
+   │   placeholder node still represents it — labelled by the discovery-detected
+   │   language when the target was extensionless, and left unlabelled otherwise
+   │   so nodeLanguage() derives it from the path, since detectedExts holds no
+   │   entry for an extensioned file.
    └── Return ImportInfo[] with module specifiers
 
 4. RESOLVE IMPORTS
@@ -489,6 +553,11 @@ When `codebase_graph_build` is called:
    ├── Handle relative paths: ./foo → foo.ts, foo/index.ts, etc.
    ├── Try path alias resolution: $lib/foo → src/lib/foo.ts, @/bar → src/bar.ts
    ├── Try extension variations per language (JS/TS extensions or CSS extensions)
+   ├── PHP: PSR-4 prefixes from every in-repo composer.json (once per build)
+   │   ├── Root manifest + each package manifest; autoload and autoload-dev
+   │   ├── Longest matching prefix wins (Acme\Auth\Db\ beats Acme\Auth\)
+   │   ├── vendor/ skipped — path repositories symlink it back to the source
+   │   └── Falls back to the directory-shaped guess when no prefix matches
    ├── SCSS partial resolution: @import "vars" → _vars.scss
    ├── CSS imports from <style> blocks → resolved with CSS extensions (.css/.scss/.sass/.less/.styl)
    ├── Check against known file set for existence
@@ -521,7 +590,7 @@ Uses depth-first search (DFS) with a recursion stack to find cycles in the direc
 
 ## Testing
 
-SocratiCode uses **vitest** as its test framework with **765 tests** across three layers.
+SocratiCode uses **vitest** as its test framework across three layers.
 
 ### Running Tests
 
@@ -547,11 +616,11 @@ npm run test:coverage
 
 ### Test Architecture
 
-| Layer | Directory | Tests | Docker | Description |
-|-------|-----------|-------|--------|-------------|
-| Unit | `tests/unit/` | 608 | No | Pure logic: config, constants, ignore rules, cross-process locking, logging, graph analysis, import extraction, path resolution, startup lifecycle |
-| Integration | `tests/integration/` | 137 | Yes | Real Docker containers: Qdrant CRUD, real Ollama embeddings, indexer, watcher, code graph, all 21 MCP tools |
-| E2E | `tests/e2e/` | 20 | Yes | Full lifecycle: health check → index → search → graph build/query/stats → watch → remove |
+| Layer | Directory | Docker | Description |
+|-------|-----------|--------|-------------|
+| Unit | `tests/unit/` | No | Pure logic: config, constants, ignore rules, cross-process locking, logging, graph analysis, import extraction, path resolution, startup lifecycle |
+| Integration | `tests/integration/` | Yes | Real Docker containers: Qdrant CRUD, real Ollama embeddings, indexer, watcher, code graph, all MCP tools |
+| E2E | `tests/e2e/` | Yes | Full lifecycle: health check → index → search → graph build/query/stats → watch → remove |
 
 ### Test Infrastructure
 
@@ -721,7 +790,7 @@ Google Generative AI embedding provider. Requires `GOOGLE_API_KEY`.
 | `deleteFileChunks` | `(collection, filePath) → Promise<void>` | Remove all chunks for a file |
 | `searchChunks` | `(collection, query, limit?, fileFilter?, languageFilter?) → Promise<SearchResult[]>` | Hybrid search (dense + BM25, RRF-fused) |
 | `searchChunksWithFilter` | `(collection, query, limit, filters) → Promise<SearchResult[]>` | Hybrid search with arbitrary payload filters |
-| `getCollectionInfo` | `(name) → Promise<{ pointsCount, status } \| null>` | Collection info (null if not found, throws on transient errors) |
+| `getCollectionInfo` | `(name) → Promise<{ pointsCount, status } \| null>` | Collection info (null if not found, throws on transient errors; first waits for this process's in-flight `ensureCollection` of the same name) |
 | `resetMetadataCollectionCache` | `() → void` | Reset cached metadata collection readiness (testing) |
 | `saveProjectMetadata` | `(collName, projectPath, filesTotal, filesIndexed, fileHashes, indexingStatus) → Promise<void>` | Persist project metadata and file hashes |
 | `loadProjectHashes` | `(collName) → Promise<Map<string, string> \| null>` | Load file content hashes (throws on transient errors) |
@@ -742,9 +811,9 @@ Google Generative AI embedding provider. Requires `GOOGLE_API_KEY`.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `generateEmbeddings` | `(texts: string[]) → Promise<number[][]>` | Batch generate embeddings with `search_document:` prefix |
-| `generateQueryEmbedding` | `(query: string) → Promise<number[]>` | Single query embedding with `search_query:` prefix |
-| `prepareDocumentText` | `(content, filePath) → string` | Prepare text with relative path prefix |
+| `generateEmbeddings` | `(texts: string[]) → Promise<number[][]>` | Batch generate embeddings for the texts as given; batching and retries only, no prefixing (callers pass text from `prepareDocumentText`) |
+| `generateQueryEmbedding` | `(query: string) → Promise<number[]>` | Single query embedding, prefixed with `search_query:` followed by a space (default; env-configurable via `EMBEDDING_QUERY_PREFIX`) |
+| `prepareDocumentText` | `(content, filePath, profile?) → string` | Build the text to embed. `profile.documentPrefix` controls the prefix and `profile.documentIncludesPath` controls whether the file path precedes the content; omitting the profile uses the requested runtime settings. |
 
 ### indexer.ts
 
@@ -768,17 +837,22 @@ Google Generative AI embedding provider. Requires `GOOGLE_API_KEY`.
 | `updateProjectIndex` | `(projectPath, onProgress?, extraExtensions?) → Promise<{ added, updated, removed, chunksCreated, cancelled }>` | Incremental update |
 | `removeProjectIndex` | `(projectPath) → Promise<void>` | Delete index, code graph, and context artifacts |
 
+### startup.ts
+
+`autoResumeIndexedProjects()` checks `SOCRATICODE_AUTO_RESUME=off` before Docker, Qdrant, explicit project lists, or any persisted-index access. Otherwise it preserves the existing current-project, explicit-list, and `all` modes. Watcher starts from startup pass through `startWatchingAutomatically`, so `manual` and `off` suppress the watcher without suppressing the catch-up update; combine watcher `off` with auto-resume `off` for a fully deliberate code-index snapshot.
+
 ### watcher.ts
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `startWatching` | `(projectPath, onProgress?) → Promise<boolean>` | Start @parcel/watcher native subscription. Returns `true` if now watching (or already was), `false` if another process holds the lock or subscription failed |
+| `startWatching` | `(projectPath, onProgress?) → Promise<boolean>` | Start @parcel/watcher native subscription. Permitted in `auto` and `manual`, rejected before lock acquisition in `off`. Returns `true` if now watching (or already was), `false` if disabled, another process holds the lock, or subscription failed |
+| `startWatchingAutomatically` | `(projectPath, onProgress?) → Promise<boolean>` | Start only in `SOCRATICODE_WATCHER=auto`; shared guard for startup and post-index/update paths |
 | `stopWatching` | `(projectPath) → Promise<void>` | Stop watcher |
 | `stopAllWatchers` | `() → Promise<void>` | Stop all watchers |
 | `isWatching` | `(projectPath) → boolean` | Check if a project is being watched **by this process** |
 | `isWatchedByAnyProcess` | `(projectPath) → Promise<boolean>` | Cross-process check: local subscriptions first, then file-based lock |
 | `getWatchedProjects` | `() → string[]` | List watched paths |
-| `ensureWatcherStarted` | `(projectPath) → void` | Fire-and-forget auto-start with TTL cache: checks not watching, not externally watched (60s cache), not indexing, collection exists |
+| `ensureWatcherStarted` | `(projectPath) → void` | Fire-and-forget auto-start in `auto` mode with TTL cache: checks not watching, not externally watched (60s cache), not indexing, collection exists. Returns before storage access in `manual`/`off` |
 | `clearExternalWatchCache` | `() → void` | Clear the external watch TTL cache (for testing) |
 
 Watcher settings:
@@ -788,13 +862,16 @@ Watcher settings:
 - Auto-stops after 10 consecutive errors
 - Cross-process lock prevents duplicate watchers
 - Cross-process status awareness: `codebase_status` and `codebase_search` detect watchers running in other MCP processes via file-based locks
-- Auto-starts on first tool interaction with an indexed project (search, status, update, graph), with 60-second TTL cache to avoid retrying when another process holds the lock
+- Auto-starts on first tool interaction with an indexed project (search, status, update, graph) only in `auto`, with 60-second TTL cache to avoid retrying when another process holds the lock
+- `manual` disables every automatic watcher start but leaves explicit `codebase_watch start` available; `off` rejects explicit starts too
+- Watcher mode is process-local. Every MCP process sharing a checkout must use the same snapshot setting; status warns when an `off` process detects another watcher
 
 ### code-graph.ts
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `buildCodeGraph` | `(projectPath, extraExtensions?, progress?) → Promise<CodeGraph>` | Build dependency graph via ast-grep with optional progress tracking |
+| `getExistingGraph` | `(projectPath) → Promise<CodeGraph \| null>` | Load a cached or persisted graph without creating one |
 | `getOrBuildGraph` | `(projectPath, extraExtensions?) → Promise<CodeGraph>` | Get cached graph or build new one |
 | `rebuildGraph` | `(projectPath, extraExtensions?) → Promise<CodeGraph>` | Force rebuild with concurrency guard (joins existing build if in progress) |
 | `invalidateGraphCache` | `(projectPath) → void` | Clear cached graph for project |
@@ -844,9 +921,17 @@ buildCodeGraph (one pass per file)
 |------------|--------|---------|
 | `{projectId}_symgraph_meta`  | 1                | `SymbolGraphMeta` (counts, builtAt, schemaVersion, unresolved%) |
 | `{projectId}_symgraph_file`  | 1 per source file | `SymbolGraphFilePayload` — symbols + outgoing calls + contentHash |
-| `{projectId}_symgraph_index` | 27 + 256 ≈ 283   | Sharded indices: name shards (`a`..`z` + `_`) and reverse-call shards (0..255) |
+| `{projectId}_symgraph_index` | 27 + 256 ≈ 283 (+ continuation parts for oversized shards) | Sharded indices: name shards (`a`..`z` + `_`) and reverse-call shards (0..255) |
 
 All points use the dummy-vector-`[0]` pattern (Qdrant requires a vector even when not used for similarity search). Points use UUID-formatted SHA-256 IDs via `uuidFromString`. The `on_disk_payload: true` flag keeps memory usage bounded.
+
+**Upserts are bounded by bytes, not just by point count.** Qdrant rejects any request body over `service.max_request_size_mb` (default 32 MiB) with an HTTP 400 whose client-side message is only `Bad Request`. A per-file payload scales with the source file, so a few large files (a 900 KB Java file yields a ~6 MB point) used to overflow a fixed 50-point batch and fail the whole request — issue #89. `saveFilePayloads` therefore packs each request up to `QDRANT_UPSERT_BUDGET_BYTES` (24 MiB, headroom under the 32 MiB ceiling) *and* the historic 50-point cap, so ordinary repos batch exactly as before while large files simply get more requests. Point ids and payload shapes are unchanged, so this is purely a transport-level change with nothing to migrate.
+
+A single file-payload point that cannot fit under `QDRANT_MAX_REQUEST_BYTES` even alone throws `SymbolGraphPointTooLargeError`, naming the file and pointing at `service.max_request_size_mb`, rather than being dropped.
+
+**Oversized shards split into parts (#99).** Name and reverse shards grow with the whole repo rather than with any one file — a name shard holds every symbol whose name starts with one character, and Java-style codebases concentrate the `g`/`s` buckets badly via `getX`/`setX` — so on a large enough codebase a single bucket outgrows the server ceiling. `saveNameShard`/`saveReverseShard` therefore split an oversized bucket across multiple points, entry by entry: part 0 stays on the shard's original id and declares `parts: N` in its payload, continuation parts live at ids derived from the shard key. A shard that fits (the overwhelmingly common case) is still written as one point with **no** `parts` field, byte-identical to what every pre-split graph contains, so existing graphs read unchanged and nothing migrates. When a shard shrinks, stale continuation parts are deleted on write. Every part of one split write also carries a shared random `write` identity: continuation ids are deterministic, so an interrupted rewrite can leave the previous write's continuations at exactly the ids a new part 0 declares, and the identity is what makes that detectable. The readers reassemble parts and return `null` (with a warning) when a declared part is missing **or carries a different write identity than part 0** — either means the shard is not one coherent write — rather than serving a partial or interleaved shard. Only one shape remains unsplittable: a single symbol name whose own reference list exceeds a part budget, which needs a six-figure occurrence count of one name and fails loudly by name. **Downgrade caveat:** a SocratiCode version predating the split reads only part 0 of a split shard, so downgrading after a large repo has written multi-part shards silently under-reports symbols until a rebuild on the old version.
+
+When symbol-graph persistence fails, `doRebuildGraph` (the rebuild driver around `buildCodeGraph`, which itself only parses files) still returns and saves the file-import graph, but records the reason on `GraphBuildCompleted.symbolGraphError` (unwrapped via `describeQdrantError`, which digs the server's real explanation out of `err.data.status.error`). `codebase_graph_status` prints it, so a half-built graph is no longer reported as a clean success while `codebase_impact` silently answers "0 callers".
 
 #### Languages with first-class symbol extraction
 
@@ -859,7 +944,7 @@ TypeScript / JavaScript / TSX, Python, Go, Rust, Java, Kotlin, Scala, C#, C, C++
 - `multiple-candidates` — name matched in more than one dependency; all candidates kept
 - `unresolved` — no symbol found anywhere reachable; left as a name-only edge
 
-`SymbolGraphMeta.unresolvedEdgePct` exposes how much of the call graph is fuzzy — useful as a quality signal.
+`SymbolGraphMeta.unresolvedEdgePct` is the percentage of captured symbol edges that matched no project symbol: `confidence: "unresolved"` over every `SymbolEdge` of any kind (call, import, re-export, type or value reference), the GDScript `engine` ones excepted. A member call is reduced to its terminal name, so a call into a runtime builtin or an external library (`setTimeout`, `JSON.stringify`, an SDK client's `pull`) is counted exactly like a project method that failed to resolve: the resolver cannot tell an external `includes` from a project one, and a callee-name allowlist would misclassify legitimate project methods. Read the value as coverage of the project's own symbols, not as a resolver failure rate; it runs high on healthy TypeScript/JavaScript code (issue #172).
 
 #### Accepted limits — what the call graph does not see
 
@@ -870,7 +955,7 @@ The call graph is built from static analysis without type inference. These class
 - **Macros** — Rust (`println!`, custom `macro_rules!`) and C / C++ preprocessor macros are not expanded. Macro invocations are captured as calls to the macro *name*, not to whatever the expansion actually calls.
 - **Framework magic** — Dependency injection (Spring `@Autowired`, Angular DI, NestJS providers), ORM metaprogramming (Rails `has_many`, ActiveRecord callbacks), decorator-driven routing where the handler is never named at a call site (Django class-based view dispatch, some FastAPI patterns), and similar indirection goes through the framework rather than through a direct call. A method that is only called via `@Autowired` will show zero callers in `codebase_impact`.
 
-`SymbolGraphMeta.unresolvedEdgePct` is the quality signal for this class of limit: consistently high values (>20%) indicate either heavy framework magic in the codebase or a language where extractor coverage is incomplete. Users running `codebase_impact` on a service-oriented codebase with heavy DI should treat "zero callers" as a hint to double-check, not a guarantee.
+`SymbolGraphMeta.unresolvedEdgePct` is the quality signal for this class of limit, read with the definition above: the share counts every captured symbol edge that no project symbol matched, GDScript `engine` calls excepted, runtime and external APIs included, so a high value on a runtime-heavy codebase is the expected shape rather than a finding, and the number alone does not separate a genuine gap (heavy framework magic, a language where extractor coverage is incomplete) from those external calls. Users running `codebase_impact` on a service-oriented codebase with heavy DI should treat "zero callers" as a hint to double-check, not a guarantee.
 
 #### Per-file incremental updates (Phase F)
 
@@ -929,9 +1014,11 @@ npx tsx scripts/benchmark-graph.ts /absolute/path/to/repo
 |--------|-----------|-------------|
 | `SocratiCodeConfig` | *(interface)* | Parsed `.socraticodecontextartifacts.json` shape: `{ artifacts?: ContextArtifact[] }` |
 | `loadConfig` | `(projectPath) → Promise<SocratiCodeConfig \| null>` | Load and validate config file (null if missing, throws on parse/validation errors) |
-| `readArtifactContent` | `(artifactPath, projectPath) → Promise<{ content, contentHash }>` | Read file or directory content with SHA-256 hash for staleness detection |
+| `ArtifactContent` | *(interface)* | One artifact's read result: `{ content, contentHash, exclusions }`. Accepted by `indexArtifact` so a caller that already read the artifact does not pay for a second read. |
+| `ArtifactExclusions` | *(interface)* | What a directory walk left out, by reason: `{ ignored, binary, unreadable }`. All zero for a single-file artifact. |
+| `readArtifactContent` | `(artifactPath, projectPath) → Promise<{ content, contentHash, exclusions }>` | Read file or directory content with SHA-256 hash for staleness detection. A directory walk skips dot-files, anything the ignore chain rejects (rooted at the artifact directory), and binary files (NUL byte in the first 8 KiB); `exclusions` counts what it left out, for the caller to log. A single-file path is read verbatim. |
 | `chunkArtifactContent` | `(content, artifactName, artifactPath) → ArtifactChunk[]` | Line-based chunking with overlap (same `CHUNK_SIZE`/`CHUNK_OVERLAP` as code) |
-| `indexArtifact` | `(projectPath, artifact, collection) → Promise<ArtifactIndexState>` | Index a single artifact: read → chunk → embed → upsert to Qdrant |
+| `indexArtifact` | `(projectPath, artifact, collection, preread?) → Promise<ArtifactIndexState>` | Index a single artifact: read → chunk → embed → upsert to Qdrant. Pass `preread` (an `ArtifactContent`) to skip the read; `ensureArtifactsIndexed` threads the content it hashed, so a re-index does not walk and re-read the directory a second time. |
 | `indexAllArtifacts` | `(projectPath) → Promise<{ indexed, errors }>` | Index all artifacts from config, saving metadata. Errors per-artifact, never throws. |
 | `ensureArtifactsIndexed` | `(projectPath) → Promise<{ reindexed, upToDate, errors }>` | Staleness check: compare content hashes, re-index only changed artifacts, remove deleted ones |
 | `searchArtifacts` | `(projectPath, query, artifactName?, limit?) → Promise<SearchResult[]>` | Hybrid semantic + BM25 search across context artifacts with optional name filter |
@@ -944,13 +1031,53 @@ npx tsx scripts/benchmark-graph.ts /absolute/path/to/repo
 |----------|-----------|-------------|
 | `extractImports` | `(source, lang, ext) → ImportInfo[]` | Extract imports from source using ast-grep AST patterns |
 
-Supports 18+ languages including TypeScript, JavaScript, Python, Java, Kotlin, Go, Rust, Ruby, PHP, C, C++, C#, Swift, Scala, Bash, Dart, and Lua.
+Supports 19+ languages including TypeScript, JavaScript, Python, Java, Kotlin, Go, Rust, Ruby, PHP, C, C++, C#, Swift, Scala, Bash, Dart, Lua, and GDScript.
+
+**GDScript (Godot) support is conditional**: the `tree-sitter-gdscript` native addon is an optional dependency resolved via `node-gyp-build`. A preflight check in an isolated child process (`gdscript-preflight.cjs`) validates the addon's N-API compatibility, ast-grep registration symbol, and parse capability before registration. When the preflight passes, AST-based extraction avoids false matches in comments and strings. When it fails, a lightweight lexer provides syntax-aware preload/load/extends extraction and line-based chunking without treating comments or strings as code. Relative `extends` and `preload` paths resolve from the script directory; relative runtime `load` paths resolve from the Godot project root. Godot resource files (`.tscn`/`.tres`) use a tokenizer-based extractor that handles arbitrary whitespace, attribute order, and `uid://` paths. See the [TSCN file format docs](https://docs.godotengine.org/en/stable/engine_details/file_formats/tscn.html) for the resource format specification.
 
 ### graph-resolution.ts
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `resolveImport` | `(specifier, importerPath, projectRoot, fileSet, language) → string \| null` | Resolve module specifier to file path |
+| `resolveImport` | `(specifier, sourceFile, projectPath, fileSet, language, aliases?, jvmSuffixMap?, csNamespaceMap?, goModuleInfo?, phpPsr4Map?, dartPackageMap?, pythonImportRoots?, elixirModuleMap?, phpFqcnMap?, rustCrates?, rustDeclaredMods?, rustIsDeclaration?, classNameIndex?, godotProjectRoot?, godotUidIndex?, fallbackSpecifier?, godotImportKind?) → string \| null` | Resolve a module specifier to a project-relative file path; null for external/stdlib modules or a resolution miss |
+| `buildJvmSuffixMap` | `(fileSet) → Map<string, string>` | Java/Kotlin/Scala: class-name suffix → file, for multi-module source layouts |
+| `buildCsNamespaceMap` | `(fileSet, projectPath) → Map<string, string[]>` | C#: `namespace X.Y` declarations → contributing files, resolving `using` directives |
+| `buildGoModuleInfo` | `(fileSet, projectPath) → GoModuleInfo[]` | Go: one entry per `go.mod` (root and nested), package dir → representative file |
+| `buildPhpPsr4Map` | `(projectPath) → Map<string, string[]>` | PHP: PSR-4 prefix → base dirs from every in-repo `composer.json` (`autoload` + `autoload-dev`) |
+| `buildPhpFqcnMap` | `(fileSet, projectPath) → Map<string, string[]>` | PHP: declared FQCN (`namespace` + class/interface/trait/enum) → declaring files, consulted after a PSR-4 miss so packages with a runtime autoloader still resolve |
+| `buildDartPackageMap` | `(projectPath) → Map<string, string>` | Dart: package name → package root from every `pubspec.yaml`; `package:<name>/<rest>` resolves to `<root>/lib/<rest>` |
+| `buildPythonManifests` | `(projectPath) → PythonManifest[]` | Python: one entry per `pyproject.toml` with its import roots and declared uv workspace members |
+| `pythonRootsForFile` | `(manifests, relSourceDir) → string[]` | Python: the import roots that apply to one file, ancestry- and membership-scoped, nearest first |
+| `buildElixirModuleMap` | `(fileSet, projectPath) → Map<string, string[]>` | Elixir: `defmodule` name → declaring files (AST-derived), resolving `alias`/`import`/`require`/`use` |
+| `hasLiteralShellPathShape` | `(specifier) → boolean` | Shell: whether a `source` argument is a literal path worth resolving |
+| `buildClassNameIndex` | `(projectPath, fileSet) → ClassNameIndex` | GDScript: legacy global class_name index retained for compatibility; use `buildGodotProjectIndexes` for project-scoped resolution |
+| `buildGodotProjectIndexes` | `(projectPath, fileSet, rootCache?) → GodotProjectIndexes` | GDScript: per-project class_name indexes, keyed by Godot project root |
+| `buildGodotUidIndexes` | `(projectPath, fileSet, rootCache?) → GodotProjectUidIndexes` | GDScript: per-project uid:// → relative path index, from .uid sidecars and .tscn/.tres headers |
+| `findGodotProjectRootForProject` | `(projectPath) → string \| null` | GDScript: find Godot project root (directory containing project.godot) |
+| `findGodotRootForFile` | `(sourceFile, godotProjectIndexes?, rootCache?) → string \| null` | GDScript: find nearest project.godot ancestor for a single file |
+
+The `GoModuleInfo` and `PythonManifest` interfaces are exported alongside their builders.
+
+The per-language `build*` helpers share one convention. Each is called once per
+graph build in `buildCodeGraph`, behind a `has<Language>` gate so projects
+without that language pay nothing. The manifest-reading ones (`go.mod`,
+`composer.json`, `pubspec.yaml`, `pyproject.toml`) discover their manifests by
+walking the filesystem with the same ignore filter the graphable walk uses,
+never by scanning `fileSet`: manifests have no AST grammar, so they are never
+in `fileSet`, and a `fileSet` scan silently matches nothing (the issue 82
+trap, documented at the Go builder). Each walk also skips one directory
+unconditionally where a generated or vendored manifest would poison the map:
+`vendor/` for Composer, `.dart_tool/` for pubspec, `site-packages/` and
+`dist-packages/` for pyproject. Results thread into `resolveImport` as
+trailing optional parameters, keeping every existing caller
+source-compatible, and duplicate names resolve first-wins in sorted path
+order so edges are deterministic across machines.
+
+PHP is the one language with two of them, consulted in order: `buildPhpPsr4Map`
+reads the manifests and answers first, and `buildPhpFqcnMap` — a `fileSet` scan,
+not a manifest walk — answers for everything the manifests do not describe. That
+covers a package with no autoload map at all as well as one whose map is
+incomplete, without either regime needing to know where the other applies.
 
 ### lock.ts
 
@@ -1031,6 +1158,8 @@ Parameters:
 
 Returns: Status message or list of watched projects
 ```
+
+`SOCRATICODE_WATCHER=manual` suppresses automatic starts but permits the `start` action. `off` rejects `start` before infrastructure or catch-up work and reports the watcher as disabled. `stop` remains available in all modes. Use `SOCRATICODE_AUTO_RESUME=off` as well when startup must not run an incremental catch-up or resume interrupted indexing.
 
 ### Query Tools
 
@@ -1156,8 +1285,9 @@ Parameters:
   projectPath?: string  — Absolute path (defaults to cwd)
 
 Returns:
-  If build in progress: Status BUILDING with phase, progress %, elapsed time
-  If ready: Status READY with node/edge count, last built time, cache status, last build duration
+  If build in progress: Status BUILDING with phase, progress % (and a skipped count when non-zero), elapsed time
+  If ready: Status READY with node/edge count, last built time, cache status, last build duration, and files skipped when non-zero
+  If a symbol graph exists: its file, symbol and call-edge counts, plus the unresolved share — the percentage of captured symbol edges (calls, imports, re-exports, type and value references) not matched to a project symbol, runtime builtins and external libraries included, GDScript engine calls excluded
   If not found: Instructions to build
 ```
 
@@ -1234,7 +1364,7 @@ Behaviour:
 
 ```typescript
 interface FileChunk {
-  id: string;            // SHA-256 of "filePath:startLine" formatted as UUID (36 chars, 8-4-4-4-12)
+  id: string;            // SHA-256 of "filePath:startLine" formatted as UUID (36 chars, 8-4-4-4-12); a piece split off by the cap is seeded from its parent's ID
   filePath: string;      // Absolute path
   relativePath: string;  // Relative to project root
   content: string;       // Chunk text content
@@ -1386,7 +1516,8 @@ Edit `CHUNK_SIZE` and `CHUNK_OVERLAP` in `src/constants.ts`. Smaller chunks give
 
 1. Set `EMBEDDING_PROVIDER` in your MCP config env block (`ollama`, `openai`, or `google`).
 2. Optionally override `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` for the chosen provider (auto-detected defaults exist for all built-in models).
-3. Re-index all projects (`codebase_remove` then `codebase_index`) since existing vectors have different dimensions.
+3. Existing collections continue using their stored effective profile. Confirm pending differences with `codebase_status`.
+4. Activate the requested settings for each intended collection with `codebase_remove`, then `codebase_index`.
 
 See `src/services/embedding-config.ts` for all supported environment variables and per-provider defaults.
 
@@ -1399,6 +1530,121 @@ See `src/services/embedding-config.ts` for all supported environment variables a
 ### Adding new ignore patterns
 
 Edit `DEFAULT_IGNORE_PATTERNS` in `src/services/ignore.ts`.
+
+---
+
+## VS Code / Open VSX Extension
+
+The repo also ships a regular VS Code extension that registers the
+SocratiCode MCP server with the editor's native MCP registry through
+`vscode.lm.registerMcpServerDefinitionProvider`. It also adds native UI:
+sidebar, status bar, interactive graph webview, walkthrough, and palette
+commands. The same `.vsix` is published to both VS Code Marketplace and
+Open VSX. A VS Code-derived editor must implement the MCP provider API for
+native MCP registration to work. Independent clients such as Cline,
+Continue, and Roo Code require their own MCP configuration.
+
+Source: [`extension/`](./extension)
+
+### Layout
+
+```text
+extension/
+├── package.json               # extension manifest
+├── tsconfig.json              # TS strict, ES2022, Node 18 target
+├── biome.json                 # lint config
+├── esbuild.config.mjs         # bundles src/extension.ts -> dist/extension.js
+├── README.md                  # marketplace landing page
+├── CHANGELOG.md               # extension-specific changelog
+├── images/icon.png            # marketplace icon
+├── walkthroughs/              # markdown shown in the getting-started walkthrough
+└── src/
+    ├── extension.ts           # activation entrypoint
+    ├── mcpProvider.ts         # registerMcpServerDefinitionProvider
+    ├── sidebar.ts             # TreeDataProvider for the activity-bar view
+    ├── graphPanel.ts          # webview panel for the interactive graph
+    ├── statusBar.ts           # status-bar item
+    ├── commands.ts            # command palette commands
+    ├── settings.ts            # typed config accessors
+    ├── output.ts              # log/output channel
+    └── __tests__/             # node:test smoke tests for the manifest
+```
+
+### Local development
+
+```bash
+cd extension
+npm install
+npm run watch        # rebuild dist/extension.js on save
+```
+
+To debug the extension live in a real VS Code instance:
+
+1. Open the `extension/` folder in VS Code.
+2. `F5` (Run > Start Debugging) launches a new "Extension Development Host"
+   window with the extension loaded.
+3. Open any folder in that host window. The MCP server registration kicks
+   in on activation; the sidebar appears in the Activity Bar.
+4. Output Channel: `View > Output > SocratiCode`.
+
+### Build, lint, test, package
+
+```bash
+cd extension
+
+npm run lint             # biome check
+npm run typecheck        # tsc --noEmit
+npm run compile          # esbuild bundle to dist/
+npm test                 # node:test smoke tests on the manifest
+npm run package          # produces socraticode-<version>.vsix
+```
+
+### Publishing
+
+The extension is published to two registries from the same `.vsix`:
+
+- **VS Code Marketplace** via `vsce publish` (Azure DevOps PAT)
+- **Open VSX Registry** via `ovsx publish` (Eclipse PAT)
+
+CI handles this on `v*` tags via `.github/workflows/extension-release.yml`.
+The required GitHub Actions secrets are `VSCE_PAT` (Azure DevOps personal
+access token with Marketplace Manage scope) and `OVSX_PAT` (Eclipse
+access token with Open VSX namespace). Each is set up once per
+publisher account. Maintainer notes for the full submission flow live
+outside this public repo.
+
+To publish manually:
+
+```bash
+cd extension
+npm run publish:vsce      # Microsoft marketplace
+npm run publish:ovsx      # Open VSX
+# or both at once:
+npm run publish:all
+```
+
+### Versioning
+
+The shipped integrations track the engine version. The
+`scripts/bump-plugin-versions.mjs` `release-it` hook updates every plugin
+manifest, `gemini-extension.json`, `extension/package.json`, both version fields
+in `extension/package-lock.json`, and both the server and npm-package versions
+in `server.json`. An engine release `vX.Y.Z` therefore publishes matching
+integration and MCP Registry metadata.
+
+### What the extension does NOT do
+
+- It does **not** re-implement the engine. All search, dependency-graph
+  analysis, impact analysis and indexing happen in the engine via the
+  registered MCP server. The extension is a thin distribution and UI
+  shell.
+- It does **not** ship its own copy of the engine. The engine launches
+  via `npx -y --prefer-online socraticode@latest` (configurable via the `socraticode.command` /
+  `socraticode.args` settings).
+- It does **not** add language-server features (code lenses, hovers,
+  diagnostics). Those would conflict with the host editor's existing
+  language servers and aren't aligned with the engine's value
+  proposition.
 
 ---
 
@@ -1425,7 +1671,7 @@ Make sure the project has been indexed first (`codebase_index`). Check the statu
 
 ### Code graph returns empty
 
-The code graph uses ast-grep for AST-based import extraction. It works for 18+ languages. If a file has no recognised imports (or uses non-standard import patterns), it may appear as an orphan node.
+The code graph uses ast-grep for AST-based import extraction. It works for 19+ languages. If a file has no recognised imports (or uses non-standard import patterns), it may appear as an orphan node.
 
 ### Large codebase is slow to index
 
